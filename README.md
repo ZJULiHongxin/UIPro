@@ -9,7 +9,7 @@
 <a href='https://huggingface.co/datasets/yifanzhang114/SMR'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Data-green'></a>
 
 <div align="center">
-<img src="https://placehold.co/800x300/F0F3F4/303638?text=UIPro+Project+Banner" alt="UIPro Project Banner">
+<img src="assets/uipro_github_banner.png" alt="UIPro Project Banner">
 </div>
 
 
@@ -31,9 +31,9 @@ UIPro is a novel generalist GUI agent that represents a breakthrough in GUI auto
 UIPro is built upon a proven vision-language model architecture. This architecture allows it to understand instructions, interpret visual information, and plan precise actions.
 
 <div align="center">
-<img src="https://i.imgur.com/2PzQe1o.png" alt="UIPro Methodology Diagram">
+<img src="assets/uipro_mainfigure.png" alt="UIPro Methodology Diagram">
 <br>
-Figure: The two-stage training process for UIPro.
+The two-stage training process for UIPro.
 </div>
 
 Training Pipeline:
@@ -113,7 +113,7 @@ Unified Action Space Design
 Our unified action space resolves conflicts between different GUI interaction frameworks by defining a single, coherent superset of actions.
 
 Example: Mobile Actions
-
+```
 {
   "mobile_actions": [
     "tap", "long_press", "drag", "input_text",
@@ -121,27 +121,30 @@ Example: Mobile Actions
     "press_enter", "swipe", "wait", "status_complete"
   ]
 }
+```
 
 This framework standardizes action arguments, like the unified swipe action:
 
 ### Example: Unified swipe action
+```
 {
   "action": "swipe",
   "start": [x, y],          // Starting coordinates
   "direction": "up",        // Movement direction
   "distance": 200           // Swipe distance in pixels
 }
+```
 
 # 📝 Citation
 If you use UIPro in your research, please consider citing our paper:
-
+```
 @inproceedings{li2025uipro,
   title={UIPro: Unleashing Superior Interaction Capability For GUI Agents},
   author={Li, Hongxin and Su, Jingran and Chen, Jingfan and Ju, Zheng and Chen, Yuntao and Li, Qing and Zhang, Zhaoxiang},
   booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
   year={2025}
 }
-
+```
 # 👥 Team & Acknowledgments
 This work was supported in part by the National Key R&D Program of China and the National Natural Science Foundation of China. We also thank the open-source community for providing foundational datasets and tools that made this research possible.
 
