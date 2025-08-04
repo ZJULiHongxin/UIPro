@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "English": 26270090,
+    "Chinese": 305405,
+    "Japanese": 112653,
+    "Russian": 6416,
+    "Arabic": 4563,
+    "Korean": 5402,
+    "Mixed/Other": 10803445,
+    "Total": 37286198
+  },
+  "percentages": {
+    "English": 70.45526604777457,
+    "Chinese": 0.8190832436173835,
+    "Japanese": 0.3021305631644181,
+    "Russian": 0.017207439600036453,
+    "Arabic": 0.012237772271659342,
+    "Korean": 0.014487934650778822,
+    "Mixed/Other": 28.97438081512092
+  }
+}
