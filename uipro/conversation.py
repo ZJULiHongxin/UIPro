@@ -1,36 +1,74 @@
+"""
+UIPro Conversation Management Module
+
+This module provides conversation handling capabilities for multi-modal interactions,
+supporting various conversation formats and separator styles used across different
+language models and chat systems.
+"""
+
 import dataclasses
 from enum import auto, Enum
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Union
 import base64
 from io import BytesIO
 from PIL import Image
 
 
 class SeparatorStyle(Enum):
-    """Different separator style."""
-    SINGLE = auto()
-    TWO = auto()
-    PLAIN = auto()
-    LLAMA_2 = auto()
-    LLAMA_3 = auto()
-    GEMMA = auto()
-    CHATML = auto()
+    """
+    Enumeration of different conversation separator styles.
+    
+    Each style defines how conversation turns are formatted and separated
+    for different language models and chat systems.
+    """
+    SINGLE = auto()     # Single separator between all turns
+    TWO = auto()        # Alternating separators for user/assistant
+    PLAIN = auto()      # Plain text without special formatting
+    LLAMA_2 = auto()    # Llama 2 specific formatting with [INST] tags
+    LLAMA_3 = auto()    # Llama 3 specific formatting with header tags
+    GEMMA = auto()      # Gemma model specific formatting
+    CHATML = auto()     # ChatML format with structured headers
 
 @dataclasses.dataclass
 class Conversation:
-    """A class that keeps all conversation history."""
+    """
+    A comprehensive conversation management class for multi-modal interactions.
+    
+    This class handles conversation history, formatting, and image processing
+    for various language models and chat systems. It supports different
+    conversation styles and can process both text and image inputs.
+    
+    Attributes:
+        system (str): System prompt or instruction for the conversation
+        roles (List[str]): List of participant roles (e.g., ["user", "assistant"])
+        messages (List[List[str]]): Conversation history as list of [role, content] pairs
+        offset (int): Starting index for conversation processing
+        sep_style (SeparatorStyle): Style used for formatting conversation separators
+        sep (str): Primary separator string between conversation turns
+        sep2 (Optional[str]): Secondary separator for alternating styles
+        version (str): Version identifier for conversation format
+        skip_next (bool): Flag to skip the next message in processing
+    """
     system: str
     roles: List[str]
     messages: List[List[str]]
     offset: int
     sep_style: SeparatorStyle = SeparatorStyle.SINGLE
     sep: str = "###"
-    sep2: str = None
+    sep2: Optional[str] = None
     version: str = "Unknown"
-
     skip_next: bool = False
 
-    def get_prompt(self):
+    def get_prompt(self) -> str:
+        """
+        Generate a formatted prompt string based on the conversation history.
+        
+        This method formats the conversation according to the specified separator
+        style, handling both text and multi-modal (image + text) messages.
+        
+        Returns:
+            str: Formatted conversation prompt ready for model input
+        """
         messages = self.messages
         if len(messages) > 0 and type(messages[0][1]) is tuple:
             messages = self.messages.copy()
@@ -143,10 +181,37 @@ class Conversation:
 
         return ret
 
-    def append_message(self, role, message):
+    def append_message(self, role: str, message: Union[str, Tuple]) -> None:
+        """
+        Add a new message to the conversation history.
+        
+        Args:
+            role (str): The role of the message sender (e.g., "user", "assistant")
+            message (Union[str, Tuple]): Message content, either text string or
+                                       tuple containing (text, image, processing_mode)
+        """
         self.messages.append([role, message])
 
-    def process_image(self, image, image_process_mode, return_pil=False, image_format='PNG', max_len=1344, min_len=672):
+    def process_image(self, image: Image.Image, image_process_mode: str, 
+                     return_pil: bool = False, image_format: str = 'PNG', 
+                     max_len: int = 1344, min_len: int = 672) -> Union[str, Image.Image]:
+        """
+        Process an image according to the specified processing mode.
+        
+        Args:
+            image (Image.Image): Input PIL image to process
+            image_process_mode (str): Processing mode ("Pad", "Default", "Crop", "Resize")
+            return_pil (bool): Whether to return PIL image or base64 string
+            image_format (str): Output image format for base64 encoding
+            max_len (int): Maximum dimension for resizing
+            min_len (int): Minimum dimension for resizing
+            
+        Returns:
+            Union[str, Image.Image]: Processed image as PIL Image or base64 string
+            
+        Raises:
+            ValueError: If image_process_mode is invalid
+        """
         if image_process_mode == "Pad":
             def expand2square(pil_img, background_color=(122, 116, 104)):
                 width, height = pil_img.size
@@ -186,7 +251,16 @@ class Conversation:
             img_b64_str = base64.b64encode(buffered.getvalue()).decode()
             return img_b64_str
 
-    def get_images(self, return_pil=False):
+    def get_images(self, return_pil: bool = False) -> List[Union[str, Image.Image]]:
+        """
+        Extract all images from the conversation messages.
+        
+        Args:
+            return_pil (bool): Whether to return PIL images or base64 strings
+            
+        Returns:
+            List[Union[str, Image.Image]]: List of processed images
+        """
         images = []
         for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
@@ -214,7 +288,13 @@ class Conversation:
                 ret[-1][-1] = msg
         return ret
 
-    def copy(self):
+    def copy(self) -> 'Conversation':
+        """
+        Create a deep copy of the current conversation.
+        
+        Returns:
+            Conversation: A new Conversation instance with copied data
+        """
         return Conversation(
             system=self.system,
             roles=self.roles,
@@ -245,6 +325,11 @@ class Conversation:
         }
 
 
+# =============================================================================
+# Pre-defined Conversation Templates
+# =============================================================================
+
+# Template for Vicuna v0 conversations with example dialogue
 conv_vicuna_v0 = Conversation(
     system="A chat between a curious human and an artificial intelligence assistant. "
            "The assistant gives helpful, detailed, and polite answers to the human's questions.",
@@ -278,6 +363,7 @@ conv_vicuna_v0 = Conversation(
 
 
 
+# Template for LLaVA with Llama 2 formatting
 conv_llava_llama_2 = Conversation(
     system="You are a helpful language and vision assistant. "
            "You are able to understand the visual content that the user provides, "
@@ -292,6 +378,7 @@ conv_llava_llama_2 = Conversation(
 )
 
 
+# Template for plain text conversations without special formatting
 conv_llava_plain = Conversation(
     system="",
     roles=("", ""),
@@ -422,7 +509,14 @@ You are a helpful assistant.""",
     sep="<|im_end|>",
 )
 
+# =============================================================================
+# Conversation Template Registry
+# =============================================================================
+
+# Default conversation template
 default_conversation = conv_vicuna_v1
+
+# Registry mapping template names to conversation instances
 conv_templates = {
     "default": conv_vicuna_v0,
     "v0": conv_vicuna_v0,
@@ -444,7 +538,15 @@ conv_templates = {
 }
 
 
+# =============================================================================
+# Module Testing and Example Usage
+# =============================================================================
+
 if __name__ == "__main__":
+    # Example usage demonstrating conversation formatting
     default_conversation = conv_llama_3
-    default_conversation.messages = [['user', 'what is the answer of 56+98+98?'], ['gpt', 'Ahoy! The answer be... 252!']]
+    default_conversation.messages = [
+        ['user', 'what is the answer of 56+98+98?'], 
+        ['gpt', 'Ahoy! The answer be... 252!']
+    ]
     print(default_conversation.get_prompt())

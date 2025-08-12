@@ -108,6 +108,70 @@ Our training dataset is the largest and most comprehensive GUI understanding col
 
 We also implemented a systematic denoising procedure to ensure data quality, removing up to 29% of noise from some data sources.
 
+### Data Compilation Pipeline
+
+First of all, create a root folder saving all raw data and a folder saving processed training samples.
+
+Android in the Wild (AiTW)
+
+First download the AiTW screenshots from ![https://box.nju.edu.cn/f/96ba5115bae24eaaa44e/](this URL) and the annotations from ![https://box.nju.edu.cn/f/1245c74fc09b4565a235/](this URL), and then unzip and place them in a folder like:
+
+
+root/
+├── AITW/
+│   ├── aitw_data_test.json
+│   └── aitw_data_train.json
+│   └── aitw_data_val.json
+│   └── aitw_images
+│       └── general
+│       └── gogleapps
+│       └── install
+│       └── single
+│       └── webshopping
+
+Next, modify the `ROOT`, `SAVE_DIR`, `SPLIT`, `POINT_FORMAT` in `utils/data_utils/make_aitw_data/make_aitw_data.py` and then run ```python utils/data_utils/make_aitw_data/make_aitw_data.py```. Finally, the processed training samples will be saved in `SAVE_DIR/AITW_processed`.
+
+
+Android in the Zoo (AitZ)
+
+First download the raw data according to the instructions in ![https://github.com/IMNearth/CoAT][the AitZ Github Repo], and then unzip and place them in a folder like:
+
+
+root/
+├── AITZ/
+│   ├── train
+│   │   └── general
+│   │   └── googleapps
+│   │   └── install
+│   │   └── single
+│   │   └── webshopping
+│   └── test
+│       └── general
+│       └── googleapps
+│       └── install
+│       └── webshopping
+
+Next, modify the `ROOT`, `SAVE_DIR`, `SPLIT`, `POINT_FORMAT` in `utils/data_utils/make_aitw_data/make_aitw_data.py` and then run ```python utils/data_utils/make_aitw_data/make_aitw_data.py```. Finally, the processed training samples will be saved in `SAVE_DIR/AITW_processed`.
+
+
+AndroidControl
+
+First download the raw data according to the instructions in ![https://github.com/google-research/google-research/blob/master/android_control/README.md][the AndroidControl Github Repo], and then unzip and place them in a folder like:
+
+
+root/
+├── AndroidControl/
+│   ├── raw
+│   │   └── android_control-00000-of-00020
+│   │   └── android_control-00001-of-00020
+│   │   └── ...
+│   │   └── android_control-00019-of-00020
+│   │   └── splits.json
+
+
+Next, modify the `ANDROIDCONTROL_ROOT`, `SAVE_DIR`, `SPLIT`, `POINT_FORMAT` in `utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py` and then run ```python utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py```. Finally, the processed training samples will be saved in `SAVE_DIR/AndroidControl_processed` and the extracted screenshot images will be saved in `ANDROIDCONTROL_ROOT/images` .
+
+
 ## 🔬 Technical Deep Dive
 Unified Action Space Design
 Our unified action space resolves conflicts between different GUI interaction frameworks by defining a single, coherent superset of actions.

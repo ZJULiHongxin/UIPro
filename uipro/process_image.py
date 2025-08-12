@@ -1,37 +1,53 @@
-import math
-from PIL import Image
+"""
+UIPro Image Processing Module
 
-from torchvision.transforms import ToTensor,ToPILImage
+This module provides comprehensive image processing utilities for the UIPro system,
+including image slicing, patching, resizing, and various preprocessing operations
+optimized for multi-modal GUI understanding tasks.
+"""
+
+import math
+from typing import List, Tuple, Union
+from PIL import Image
 import torch
 from torch.nn import functional as F
 import torchvision.transforms.functional as TF
-#-------------------------------------------------------#
-#  预处理图像
-#-------------------------------------------------------#
-PATCH_SIZE       = 14
-PATCH_NUM_WIDTH  = 24
-PATCH_NUM_HEIGHT = 24
-POSITION_EMBEDDING_LENGTH = 1024
-# 576
-MAX_PATCHES      = PATCH_NUM_WIDTH * PATCH_NUM_HEIGHT
-# 
-TOKEN_LENGTH     = 3 * PATCH_SIZE * PATCH_SIZE
-# 336 336
-IMAGE_WIDTH      = PATCH_SIZE * PATCH_NUM_WIDTH
-IMAGE_HEIGHT     = PATCH_SIZE * PATCH_NUM_HEIGHT
 
-def torch_extract_patches(image_tensor, patch_height, patch_width):
+
+# =============================================================================
+# Image Processing Constants
+# =============================================================================
+
+# Patch configuration for image tokenization
+PATCH_SIZE: int = 14                                    # Size of each image patch
+PATCH_NUM_WIDTH: int = 24                              # Number of patches horizontally
+PATCH_NUM_HEIGHT: int = 24                             # Number of patches vertically
+POSITION_EMBEDDING_LENGTH: int = 1024                  # Length of position embeddings
+
+# Derived constants
+MAX_PATCHES: int = PATCH_NUM_WIDTH * PATCH_NUM_HEIGHT  # Maximum number of patches (576)
+TOKEN_LENGTH: int = 3 * PATCH_SIZE * PATCH_SIZE        # Length of each patch token
+IMAGE_WIDTH: int = PATCH_SIZE * PATCH_NUM_WIDTH        # Standard image width (336)
+IMAGE_HEIGHT: int = PATCH_SIZE * PATCH_NUM_HEIGHT      # Standard image height (336)
+
+# =============================================================================
+# Core Image Processing Functions
+# =============================================================================
+
+def torch_extract_patches(image_tensor: torch.Tensor, patch_height: int, patch_width: int) -> torch.Tensor:
     """
-    Utiliy function to extract patches from a given image tensor. Returns a tensor of shape (1, `patch_height`,
-    `patch_width`, `num_channels`x `patch_height` x `patch_width`)
-
+    Extract patches from a given image tensor using unfold operation.
+    
+    This utility function extracts non-overlapping patches from an image tensor,
+    which is useful for vision transformer and patch-based processing.
+    
     Args:
-        image_tensor (torch.Tensor):
-            The image tensor to extract patches from.
-        patch_height (int):
-            The height of the patches to extract.
-        patch_width (int):
-            The width of the patches to extract.
+        image_tensor (torch.Tensor): Input image tensor of shape (C, H, W)
+        patch_height (int): Height of each patch to extract
+        patch_width (int): Width of each patch to extract
+        
+    Returns:
+        torch.Tensor: Extracted patches of shape (1, num_patches_h, num_patches_w, C*patch_h*patch_w)
     """
 
     image_tensor = image_tensor.unsqueeze(0)
@@ -44,95 +60,163 @@ def torch_extract_patches(image_tensor, patch_height, patch_width):
     )
     return patches.unsqueeze(0)
 
-# 用于计算adapt需要输入图片的大小
-def adapt_size(originHeight:int,originWeight:int, \
-            patchHeight:int = PATCH_SIZE,patchWidth:int = PATCH_SIZE, \
-            maxPatches:int = MAX_PATCHES):
-    ### 用于计算adapt的图片大小
-    # 参数说明 
-    # originHeight:              原图高度
-    # originWidth:               原图宽度
-    # patchHeight:               patch高度
-    # patchWidth:                patch宽度
-    # maxPatches:                patch数目上限
-    # 返回值说明:
-    # resized_height:            插值后图片高度
-    # resized_width:             插值后图片宽度
-    # resized_patch_height_num:  插值后图片垂直patch数目
-    # resized_patch_width_num:   插值后图片水平patch数目
-    scale = math.sqrt(maxPatches * (patchHeight / originHeight) * (patchWidth / originWeight))
-    resized_patch_height_num = max(min(math.floor(scale * originHeight / patchHeight), maxPatches), 1)
-    resized_patch_width_num = max(min(math.floor(scale * originWeight / patchWidth), maxPatches), 1)
+def adapt_size(origin_height: int, origin_width: int, 
+               patch_height: int = PATCH_SIZE, patch_width: int = PATCH_SIZE,
+               max_patches: int = MAX_PATCHES) -> Tuple[int, int, int, int]:
+    """
+    Calculate optimal image dimensions for adaptive resizing while maintaining aspect ratio.
+    
+    This function computes the best resize dimensions that fit within the patch limit
+    while preserving the original aspect ratio as much as possible.
+    
+    Args:
+        origin_height (int): Original image height
+        origin_width (int): Original image width  
+        patch_height (int): Height of each patch (default: PATCH_SIZE)
+        patch_width (int): Width of each patch (default: PATCH_SIZE)
+        max_patches (int): Maximum number of patches allowed (default: MAX_PATCHES)
+        
+    Returns:
+        Tuple[int, int, int, int]: 
+            - resized_height: Interpolated image height
+            - resized_width: Interpolated image width
+            - resized_patch_height_num: Number of vertical patches
+            - resized_patch_width_num: Number of horizontal patches
+    """
+    scale = math.sqrt(max_patches * (patch_height / origin_height) * (patch_width / origin_width))
+    resized_patch_height_num = max(min(math.floor(scale * origin_height / patch_height), max_patches), 1)
+    resized_patch_width_num = max(min(math.floor(scale * origin_width / patch_width), max_patches), 1)
     resized_height = max(resized_patch_height_num * PATCH_SIZE, 1)
     resized_width = max(resized_patch_width_num * PATCH_SIZE, 1)
     return resized_height, resized_width, resized_patch_height_num, resized_patch_width_num
 
-def cal_num_of_slices(origin_image_width, origin_image_height):
-    scale = origin_image_width*origin_image_height/(IMAGE_WIDTH*IMAGE_HEIGHT)  
+def cal_num_of_slices(origin_image_width: int, origin_image_height: int) -> Tuple[int, int]:
+    """
+    Calculate the optimal number of slices for image partitioning.
+    
+    This function determines how to slice an image into smaller parts while
+    maintaining aspect ratio similarity and staying within processing limits.
+    
+    Args:
+        origin_image_width (int): Original image width in pixels
+        origin_image_height (int): Original image height in pixels
+        
+    Returns:
+        Tuple[int, int]: Optimal number of slices (width_slices, height_slices)
+    """
+    # Calculate scale factor based on image area vs standard area
+    scale = origin_image_width * origin_image_height / (IMAGE_WIDTH * IMAGE_HEIGHT)  
     scale = math.ceil(scale)
+    
+    # Limit maximum scale to 6 for computational efficiency
     if scale > 6:
         scale = 6
-    def factorize(n):
+    
+    def factorize(n: int) -> List[Tuple[float, int, int]]:
+        """Generate factorization ratios for a given number."""
         factors = []
         for i in range(1, n + 1):
             if n % i == 0:
-                factors.append((i/(n/i), i, n // i))
+                factors.append((i / (n / i), i, n // i))
         return factors
+    
+    # Pre-compute factorizations for possible scales
     numbers = [1, 2, 3, 4, 5, 6, 7]
-    factor_dict = {}
-    for num in numbers:
-        factor_dict[num] = factorize(num)
-    log_origin_ratio = math.log(origin_image_width/origin_image_height)
-    available_ratios = []
-    if scale<=2:
+    factor_dict = {num: factorize(num) for num in numbers}
+    
+    # Calculate original aspect ratio in log space for better comparison
+    log_origin_ratio = math.log(origin_image_width / origin_image_height)
+    
+    # Select available ratios based on scale
+    if scale <= 2:
         available_ratios = factor_dict[scale] + factor_dict[scale + 1]
-    else :
-        available_ratios = factor_dict[scale-1] + factor_dict[scale]+factor_dict[scale+1]
-    min_dif = 1000 
-    best_w = 0
-    best_h = 0
-    for (r,w_slice,h_slice) in available_ratios:
-        log_r = math.log(r)
-        if min_dif > abs(log_r - log_origin_ratio):
-            min_dif = abs(log_r - log_origin_ratio)
+    else:
+        available_ratios = factor_dict[scale - 1] + factor_dict[scale] + factor_dict[scale + 1]
+    
+    # Find the factorization that best matches the original aspect ratio
+    min_diff = float('inf')
+    best_w, best_h = 1, 1
+    
+    for ratio, w_slice, h_slice in available_ratios:
+        log_ratio = math.log(ratio)
+        diff = abs(log_ratio - log_origin_ratio)
+        if diff < min_diff:
+            min_diff = diff
             best_w = w_slice
             best_h = h_slice
     
-    return best_w,best_h
-# 做图片切片     
-def get_patch_nums(origin_image_width, origin_image_height):
-    # 输入原图的尺寸
-    # 返回：
-    # slice_w_num 切片的w方向有多少个patch
-    # slice_h_num 切片的h方向有多少个patch
-    # abstract_w_num 原图的w方向有多少个patch
-    # abstract_h_num 原图的h方向有多少个patch
+    return best_w, best_h
+def get_patch_nums(origin_image_width: int, origin_image_height: int) -> Tuple[int, int, int, int]:
+    """
+    Calculate patch numbers for both sliced and abstract image representations.
     
-    best_w, best_h = cal_num_of_slices(origin_image_width,origin_image_height)
-    slice_width = origin_image_width//best_w
-    slice_height = origin_image_height//best_h
-    _,_,slice_h_num,slice_w_num = adapt_size(slice_height,slice_width)
-    _,_,abstract_h_num,abstract_w_num = adapt_size(origin_image_height,origin_image_width)
+    This function determines the optimal patch distribution for an image that will
+    be processed in both sliced format (for detailed analysis) and abstract format
+    (for global understanding).
+    
+    Args:
+        origin_image_width (int): Original image width in pixels
+        origin_image_height (int): Original image height in pixels
+        
+    Returns:
+        Tuple[int, int, int, int]: 
+            - slice_w_num: Number of patches horizontally per slice
+            - slice_h_num: Number of patches vertically per slice  
+            - abstract_w_num: Number of patches horizontally for full image
+            - abstract_h_num: Number of patches vertically for full image
+    """
+    # Calculate optimal slicing configuration
+    best_w, best_h = cal_num_of_slices(origin_image_width, origin_image_height)
+    
+    # Calculate dimensions of individual slices
+    slice_width = origin_image_width // best_w
+    slice_height = origin_image_height // best_h
+    
+    # Get patch numbers for individual slices
+    _, _, slice_h_num, slice_w_num = adapt_size(slice_height, slice_width)
+    
+    # Get patch numbers for the abstract (full) image
+    _, _, abstract_h_num, abstract_w_num = adapt_size(origin_image_height, origin_image_width)
 
-    return slice_w_num,slice_h_num,abstract_w_num,abstract_h_num
+    return slice_w_num, slice_h_num, abstract_w_num, abstract_h_num
 
-def slice_image_any_res(image):
+
+# =============================================================================
+# Image Slicing and Windowing Functions  
+# =============================================================================
+
+def slice_image_any_res(image: Image.Image) -> List[Image.Image]:
+    """
+    Slice an image into optimal sub-regions based on aspect ratio analysis.
     
-    # slice the image according to our princeple
-    # return an array of slices
+    This function divides an image into smaller regions that maintain good
+    aspect ratios for processing, following the principles of the any-resolution
+    image processing pipeline.
     
-    origin_image_width  = image.size[0]
+    Args:
+        image (Image.Image): Input PIL image to be sliced
+        
+    Returns:
+        List[Image.Image]: List of image slices as PIL Image objects
+    """
+    origin_image_width = image.size[0]
     origin_image_height = image.size[1]
 
-    best_w, best_h = cal_num_of_slices(origin_image_width=origin_image_width,origin_image_height=origin_image_height)
+    # Calculate optimal slicing configuration
+    best_w, best_h = cal_num_of_slices(origin_image_width, origin_image_height)
     
     slices = []
     
+    # Extract slices in row-major order
     for j in range(best_h):
         for i in range(best_w):
+            # Calculate bounding box for current slice
+            left = i * origin_image_width // best_w
+            top = j * origin_image_height // best_h
+            right = (i + 1) * origin_image_width // best_w
+            bottom = (j + 1) * origin_image_height // best_h
             
-            box = (i * origin_image_width//best_w, j * origin_image_height//best_h, (i + 1) * origin_image_width//best_w, (j + 1) * origin_image_height//best_h)
-         
+            box = (left, top, right, bottom)
             region = image.crop(box).convert("RGB")
             slices.append(region)
           

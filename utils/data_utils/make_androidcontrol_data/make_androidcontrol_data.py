@@ -1,3 +1,23 @@
+"""
+AndroidControl dataset conversion and sample generation utilities.
+
+This module reads AndroidControl TFRecord episodes, decodes screenshots and
+accessibility trees, filters/validates UI elements, and generates model-ready
+samples for multiple tasks, including:
+
+- Action planning (high-level and high+low-level variants)
+- Intent grounding (optional)
+
+The code favors correctness and traceability: each step keeps track of the
+current UI, action metadata, and lightweight statistics for reporting.
+
+Note: The original codebase includes domain-specific templates and utilities
+imported from `task_prompt_lib` and `misc`. Those symbols are treated as
+black-box utilities here and should remain unchanged.
+"""
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import json, os, random, cv2, re, tensorflow as tf
 from tqdm import tqdm
 from android_env.proto.a11y import android_accessibility_forest_pb2
@@ -10,65 +30,122 @@ from collections import defaultdict
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from task_prompt_lib import *
-from misc import parse_axtrees_proto, resize_image, find_smallest_box_containing_point, is_pure_color, box2center, random_substring, revise_swipe_action, keep_unique_actions, lower_first_letter
+from misc import (
+    parse_axtrees_proto,
+    resize_image,
+    find_smallest_box_containing_point,
+    is_pure_color,
+    box2center,
+    random_substring,
+    revise_swipe_action,
+    keep_unique_actions,
+    lower_first_letter,
+)
 
-def generate_negative_action_plans(gt_act_type, W, H, scale, gt_center=None, neg_boxes=None, direction='', text='', goal_status=''):
-    neg_action_plans = []
-    
-    neg_actions_other_types = []
-    # If the GT action is click, generate negatives using other elem boxes
+# Treat very short windows as status bars; skip strict validation for them
+MAX_STATUSBAR_HEIGHT = 130
+
+def generate_negative_action_plans(
+    gt_act_type: str,
+    W: int,
+    H: int,
+    scale: int,
+    gt_center: Optional[Sequence[float]] = None,
+    neg_boxes: Optional[Sequence[Sequence[int]]] = None,
+    direction: str = '',
+    text: str = '',
+    goal_status: str = ''
+) -> List[List[List[str]]]:
+    """Generate negative action plans for contrastive/evaluation purposes.
+
+    Arguments:
+        gt_act_type: Ground-truth action type, e.g., 'click', 'scroll', etc.
+        W, H: Width and height of the current UI image.
+        scale: Normalization scale for coordinates.
+        gt_center: Optional ground-truth (x, y) center in original pixel space.
+        neg_boxes: Optional sequence of negative candidate boxes.
+        direction: Scroll direction when the ground-truth action is 'scroll'.
+        text: Text content associated with input/open-app actions.
+        goal_status: Goal status string for 'status' actions.
+
+    Returns:
+        A list of negative action plan lists. Each inner list contains pairs of
+        [reason, action_json_like_string].
+    """
+
+    neg_action_plans: List[List[List[str]]] = []
+
+    # Normalize optional inputs to avoid None checks downstream
+    if neg_boxes is None:
+        neg_boxes = []
+
+    neg_actions_other_types: List[List[str]] = []
+
+    # If the GT action is a touch action, generate negatives using other element boxes
     if len(neg_boxes) >= 1:
         for act_type, template in zip(['click', 'long_press'], [CLICK_TEMPLATE, LONG_PRESS_TEMPLATE]):
             if gt_act_type == act_type:
-                neg_cands = []
+                # Generate negative targets by sampling other boxes
+                neg_cands: List[List[str]] = []
                 selected_idxs = random.sample(list(range(len(neg_boxes))), min(len(neg_boxes), 9))
                 for idx in selected_idxs:
                     box = neg_boxes[idx]
                     normalized_center = box2center(box, W, H, scale)
                     neg_click = template.format(target_x=normalized_center[0], target_y=normalized_center[1])
                     neg_cands.append([INCORRECT_CLICK_TARGET.format(action=act_type), neg_click])
-                
+
                 random.shuffle(neg_cands)
                 neg_action_plans.append(neg_cands)
             else:
+                # Keep the target location but switch the touch mode (click vs long_press)
                 if gt_center is not None:
-                    normalized_center = [max(0, min(scale,round(gt_center[0]/W*scale))), max(0, min(scale,round(gt_center[1]/H*scale)))]
+                    normalized_center = [
+                        max(0, min(scale, round(gt_center[0] / W * scale))),
+                        max(0, min(scale, round(gt_center[1] / H * scale)))
+                    ]
                 else:
                     normalized_center = box2center(random.choice(neg_boxes), W, H, scale)
-                
+
                 neg_act = template.format(target_x=normalized_center[0], target_y=normalized_center[1])
-                if gt_act_type in ['click','long_press']:
-                    incorr_reson = INCORRECT_TOUCH_MODE + f". Should {gt_act_type} instead of {act_type}"
+                if gt_act_type in ['click', 'long_press']:
+                    incorr_reason = INCORRECT_TOUCH_MODE + f". Should {gt_act_type} instead of {act_type}"
                 else:
-                    incorr_reson = INCORRECT_ACTION
+                    incorr_reason = INCORRECT_ACTION
 
-                neg_actions_other_types.append([incorr_reson, neg_act])
+                neg_actions_other_types.append([incorr_reason, neg_act])
 
+    # For scroll, generate negatives for directions different from the GT direction
     if gt_act_type == 'scroll':
         neg_cands = []
-        for dir in ['up', 'down', 'left', 'right']:
-            if direction == dir: continue
-            direction, start, end = format_swiping_dual_points(dir, scale=scale, scroll2swipe=False)
-            neg_swipe = SWIPE_TEMPLATE.format(start_x=start[0], start_y=start[1], direction=direction, distance="medium")
-            neg_cands.append([INCORRECT_SWIPE_DIRECTION + f'. Should swipe {direction} instead of {dir}', neg_swipe])
-        
+        for cand_dir in ['up', 'down', 'left', 'right']:
+            if direction == cand_dir:
+                continue
+            swipe_dir, start, end = format_swiping_dual_points(cand_dir, scale=scale, scroll2swipe=False)
+            neg_swipe = SWIPE_TEMPLATE.format(start_x=start[0], start_y=start[1], direction=swipe_dir, distance="medium")
+            neg_cands.append([INCORRECT_SWIPE_DIRECTION + f'. Should swipe {swipe_dir} instead of {cand_dir}', neg_swipe])
+
         random.shuffle(neg_cands)
         neg_action_plans.append(neg_cands)
     else:
-        direction, start, end = format_swiping_dual_points(random.choice(['up', 'down', 'left', 'right']), scale=scale, scroll2swipe=False)
-        neg_swipe = SWIPE_TEMPLATE.format(start_x=start[0], start_y=start[1], direction=direction, distance="medium")
+        # If GT is not scroll, mix in a random swipe negative
+        rand_dir = random.choice(['up', 'down', 'left', 'right'])
+        swipe_dir, start, end = format_swiping_dual_points(rand_dir, scale=scale, scroll2swipe=False)
+        neg_swipe = SWIPE_TEMPLATE.format(start_x=start[0], start_y=start[1], direction=swipe_dir, distance="medium")
         neg_actions_other_types.append([INCORRECT_ACTION, neg_swipe])
 
+    # If GT is input_text, generate character-level variant negatives
     if gt_act_type == 'input_text':
         neg_cands = []
         used = [text]
         for _ in range(9):
             rand_text = random_substring(text)
-            if rand_text in used: continue
+            if rand_text in used:
+                continue
             used.append(rand_text)
             neg_type = INPUT_TEMPLATE.format(text=rand_text)
             neg_cands.append([INCORRECT_INPUT_TEXT + f'. Should be "{text}" instead of "{rand_text}"', neg_type])
-        
+
+    # Add an open_app negative candidate
     app = random.choice([
         "Facebook", "Instagram", "WhatsApp", "TikTok", "Snapchat",
         "YouTube", "Twitter", "Spotify", "Netflix", "Zoom",
@@ -79,45 +156,48 @@ def generate_negative_action_plans(gt_act_type, W, H, scale, gt_center=None, neg
     incorr_reason = INCORRECT_OPEN_APP + f'. Should be {text} instead of {app}.' if gt_act_type == 'open_app' else INCORRECT_ACTION
     neg_actions_other_types.append([incorr_reason, neg_open_app])
 
-    # Generate negatives only for input_text actions as input_text is not a very confusing negative candidate for other action types
+    # Navigation negatives
     if gt_act_type != 'navigate_back':
         neg_back = NAVIGATE_BACK_TEMPLATE
         incorr_reason = INCORRECT_NAVIGATION_ACTION + '. Should navigate home instead of navigate back.' if 'home' in gt_act_type else INCORRECT_ACTION
         neg_actions_other_types.append([incorr_reason, neg_back])
-    
+
     if gt_act_type != 'navigate_home':
         neg_home = NAVIGATE_HOME_TEMPLATE
         incorr_reason = INCORRECT_NAVIGATION_ACTION + '. Should navigate back instead of navigate home.' if 'back' in gt_act_type else INCORRECT_ACTION
         neg_actions_other_types.append([incorr_reason, neg_home])
-    
+
+    # Status negatives
     if gt_act_type == 'status':
-        if goal_status == 'successful': neg_status = 'infeasible'
-        elif goal_status == 'infeasible': neg_status = 'successful'
+        if goal_status == 'successful':
+            neg_status = 'infeasible'
+        elif goal_status == 'infeasible':
+            neg_status = 'successful'
+        else:
+            neg_status = random.choice(['successful', 'infeasible'])
         incorr_reason = INCORRECT_STATUS
     else:
         neg_status = random.choice(['successful', 'infeasible'])
         incorr_reason = INCORRECT_ACTION
-        
+
     neg_status = STATUS_TEMPLATE.format(goal_status=neg_status, answer='')
     neg_actions_other_types.append([incorr_reason, neg_status])
     random.shuffle(neg_actions_other_types)
     neg_action_plans.append(neg_actions_other_types)
-    
+
     return neg_action_plans
 
 
-#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 
-SPLIT = ['train', 'test'][1]
+SPLIT = ['train', 'test'][0]
 
 RESUME = True
 
 DEBUG = False    
 
 PLANNING = True; ADD_DUMMY_COMPLETE = True
-REWARDMODEL_EVAL = False
-OUTCOME_REWARDMODEL_EVAL = False
-INTENTGND = False; POINT_FORMAT = 'qwen'
+INTENTGND = False; POINT_FORMAT = ['plain', 'qwen'][1]
 
 SCALE = 1000
 LONGEST = 1008
@@ -133,7 +213,7 @@ DEVICE_TAG = "Android"
 DRAW = False
 planning_cnt = 0
 
-ANDROIDCONTROL_ROOT = ["/mnt/vdb1/hongxin_li/AndroidControl/raw", "/mnt/shared-storage/groups/stepone_mm/lhx/ui_data/AndroidControl_raw"][-1]
+ANDROIDCONTROL_ROOT = ["/mnt/vdb1/hongxin_li/AndroidControl/raw", "/mnt/shared-storage/groups/stepone_mm/lhx/ui_data/AndroidControl_raw"][0]
 
 with open(os.path.join(ANDROIDCONTROL_ROOT, "splits.json"), "r") as f:
     splits = json.load(f)
@@ -145,15 +225,14 @@ apps = {k:set() for k in splits.keys()}
 
 DATASET_NAME = "AndroidControl" + ("_debug" if DEBUG else "") + ("_test" if SPLIT == 'test' else "")
 
-SAVE_ROOT = f"/mnt/jfs/copilot/lhx/ui_data/{DATASET_NAME}"
-save_trajs_to = SAVE_ROOT
-print(f"save imgs to {save_trajs_to}")
+SAVE_DIR = f"/mnt/jfs/copilot/lhx/ui_data/{DATASET_NAME}"
+print(f"save imgs to {SAVE_DIR}")
 
-save_invalidcache_to = os.path.join(SAVE_ROOT, "invalid_cache")
+save_invalidcache_to = os.path.join(SAVE_DIR, "invalid_cache")
 #if os.path.exists(save_invalidcache_to): shutil.rmtree(save_invalidcache_to)
 os.makedirs(save_invalidcache_to, exist_ok=True)
 
-samples, rewardmodel_eval_samples, outcome_rewardmodel_eval_samples = [], [], []
+samples = []
 open_app_indices  = set()
 
 avg_iou_list = []
@@ -162,7 +241,6 @@ invalid_UIs = []
 total_ep_cnt, valid_ep_cnt = 0, 0
 total_step_cnt, valid_step_cnt = 0, 0
 valid_elem_cnt = 0
-reward_model_eval_cnt, outcome_reward_model_eval_cnt = 0, 0
 node_invalid_types = defaultdict(int)
 
 intentgnd_cnt = 0
@@ -197,16 +275,15 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
 
     save_img_to = None
 
+    # Collect indices of open_app actions for optional analytics
     for step_idx, act in enumerate(actions):
         if 'open_app' in act:
-            if step_idx >= 2:
-                1+1
             open_app_indices.add(step_idx)
 
     action_meta = [] # 保存动作轨迹，用以标注功能
     valid_sc_list = []
 
-    # fix the waiting action ref_exp
+    # Cache a random waiting instruction to keep this episode consistent
     WAITING_STEP_INSTRUC = random.choice(WAIT_INSTRUC)
 
     for step_idx, (raw_AXTree, screenshot) in enumerate(zip(raw_AXTrees, screenshots)):
@@ -217,7 +294,7 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
 
         if step_idx == 0:
             app_name = list(forest.windows[0].tree.nodes)[0].package_name
-            save_img_to = os.path.join(save_trajs_to, 'images', app_name, str(ep_id))
+            save_img_to = os.path.join(SAVE_DIR, 'images', app_name, str(ep_id))
             os.makedirs(save_img_to, exist_ok=True)
 
         # 解析UI图像
@@ -247,8 +324,8 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
         for win_idx, node_key_attrs in enumerate(node_key_attrs_lst):
             window_H, window_W = forest.windows[win_idx].bounds_in_screen.bottom - forest.windows[win_idx].bounds_in_screen.top, forest.windows[win_idx].bounds_in_screen.right - forest.windows[win_idx].bounds_in_screen.left
             window_H = round(window_H * ratio); window_W = round(window_W * ratio)
-            # 跳过状态栏检查
-            if window_H <= 130:
+            # Skip strict checks for status bar windows
+            if window_H <= MAX_STATUSBAR_HEIGHT:
                 new_node_key_attrs_lst.append(node_key_attrs)
                 continue
 
@@ -408,7 +485,7 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
         valid_elem_cnt += valid_elem_cnt_this_step
 
         click_action_added = False
-        if (PLANNING or INTENTGND or REWARDMODEL_EVAL) and step_idx in remained_indices and valid_elem_cnt_this_step:
+        if (PLANNING or INTENTGND) and step_idx in remained_indices and valid_elem_cnt_this_step:
             cur_action = ast.literal_eval(actions[step_idx])
             neg_actions = None
 
@@ -471,10 +548,6 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
                         action_meta[-1] = {"action_type": "DualPoint", "touch_point": [click_x, click_y], "lift_point": [click_x, click_y], "typed_text": f"TAP:{interacted_node['class']} Box:[{interacted_box[0]},{interacted_box[1]},{interacted_box[2]},{interacted_box[3]}]", "action_refexp": action_refexp}
                         click_action_added = True
 
-                        # Make reward model evaluation samples
-                        if REWARDMODEL_EVAL:
-                            neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, gt_center=[click_x, click_y], neg_boxes=[x['box'] for i, x in enumerate(main_app_elems) if i!=index])
-
                     # intentgnd
                     if INTENTGND and SPLIT != 'test':
                         intent = lower_first_letter(action_refexp if USE_ACTION_REFEXP else step_instructions[step_idx])
@@ -493,9 +566,6 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
 
                     action_refexp = random.choice(SWIPE_PHRASES).format(direction=direction)
 
-                    # Make reward model evaluation samples
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, neg_boxes=[x['box'] for x in main_app_elems], direction=direction)
 
                 elif action_type == 'navigate_back':
                     action_str = NAVIGATE_BACK_TEMPLATE
@@ -512,24 +582,15 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
                     text = cur_action['text'].strip(' \\').replace("\n", "\\n").replace('"', '\\"')
                     action_str = INPUT_TEMPLATE.format(text=text)
                     action_refexp = random.choice(INPUT_ACTION_PREFIXES_WITH_TEXT['specific']).format(text=text, target="the text box")
-                    # Make reward model evaluation samples
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, neg_boxes=[x['box'] for x in main_app_elems], text=text)
 
                 # No termination is provided in Android Control dataset. So we need to generate termination action for the last step.
                 elif action_type == 'status':
                     action_str = STATUS_TEMPLATE.format(goal_status=cur_action['goal_status'], answer='')
                     action_refexp = random.choice(TASK_STATUS_SENTENCES[cur_action['goal_status']])
-                    # Make reward model evaluation samples
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, neg_boxes=[x['box'] for x in main_app_elems], status=cur_action['goal_status'])
 
                 elif action_type == 'open_app':
                     action_str = OPEN_APP_TEMPLATE.format(app_name=cur_action['app_name'])
                     action_refexp = random.choice(OPEN_APP_PREFIXES).format(app_name=cur_action['app_name'])
-                    # Make reward model evaluation samples
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, neg_boxes=[x['box'] for x in main_app_elems], text=cur_action['app_name'])
 
                 else:
                     # '{"action_type":"input_text","text":"Paramedic news"}' | '{"action_type":"wait"}' | '{"action_type":"navigate_home"}' | '{"action_type":"navigate_back"}'
@@ -567,12 +628,12 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
 
                     # Debug the bboxes
                     if False:
-                        img = cv2.imread(os.path.join(os.path.dirname(SAVE_ROOT), sample["image"]))
+                        img = cv2.imread(os.path.join(os.path.dirname(SAVE_DIR), sample["image"]))
                         for bbox in sample['bboxes']:
                             cv2.rectangle(img, (int(bbox[0] * W), int(bbox[1] * H)), (int(bbox[2] * W), int(bbox[3] * H)), (0, 0, 255), 2)
                         cv2.imwrite("test.png", img)
 
-                    assert os.path.exists(os.path.join(os.path.dirname(SAVE_ROOT), sample["image"]))
+                    assert os.path.exists(os.path.join(os.path.dirname(SAVE_DIR), sample["image"]))
                 
 
                     if step_idx < min(len(raw_AXTrees), len(screenshots)) - 1:
@@ -592,12 +653,6 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
                     
                     valid_step_cnt += 1
 
-                if REWARDMODEL_EVAL:
-                    if neg_actions is None:
-                        neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, neg_boxes=[x['box'] for x in main_app_elems])
-                    
-                    neg_sample = {'id': f'autogui_andcon_rewardmodeleval_{reward_model_eval_cnt}', "image": short_img_path, "next_image": short_nextimg_path, 'ep_id': ep_id, 'step_id': step_idx, 'task': task, 'step_instruction': step_instructions[step_idx], "action_type": action_type, "history": retained_history, 'gt_action': action_str, 'neg_actions': neg_actions, "task_attr": task_attr, "wxh": f"{W}x{H}"}
-                    rewardmodel_eval_samples.append(neg_sample); reward_model_eval_cnt += 1
     else:
         if PLANNING and step_idx == len(raw_AXTrees) - 1:
             # HL
@@ -618,9 +673,6 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
             samples.append(sample)
             planning_cnt += 1
 
-    if OUTCOME_REWARDMODEL_EVAL:
-        outcome_verif_sample = {'id': f'autogui_andcon_outcomerewardmodeleval_{outcome_reward_model_eval_cnt}', 'ep_id': ep_id, 'step_id': step_idx, 'task': task, "images": valid_sc_list, 'step_instructions': step_instructions, "actions": actions}
-        outcome_rewardmodel_eval_samples.append(outcome_verif_sample); outcome_reward_model_eval_cnt += 1
                     
     assert len(action_meta) == len(screenshots)
 
@@ -644,9 +696,9 @@ for x in samples:
         act_stats[re.search(r'"action_type":\s*"([^"]+)"', x['conversations'][1]['value']).group(1)] += 1
 
 scale_str = f"_s{SCALE}" if SCALE != -1 else "_unnorm"
-save_file = os.path.join(SAVE_ROOT, f"{DATASET_NAME}{'_wActRef' if USE_ACTION_REFEXP else ''}{'_IntengGnd' if INTENTGND else ''}{scale_str}_{len(samples)}.json")
+save_file = os.path.join(SAVE_DIR, f"{DATASET_NAME}{'_wActRef' if USE_ACTION_REFEXP else ''}{'_IntengGnd' if INTENTGND else ''}{scale_str}_{len(samples)}.json")
 
-with open(os.path.join(SAVE_ROOT, save_file.replace(".json", "_stats.json")), "w") as f:
+with open(os.path.join(SAVE_DIR, save_file.replace(".json", "_stats.json")), "w") as f:
     json.dump({"report": report, "valid_ep_cnt": valid_ep_cnt, 
                "total_ep_cnt": total_ep_cnt,
                "valid_step_cnt": valid_step_cnt,
@@ -654,7 +706,6 @@ with open(os.path.join(SAVE_ROOT, save_file.replace(".json", "_stats.json")), "w
                "valid_elem_cnt": valid_elem_cnt,
                "iterated_elem_cnt": iterated_elem_cnt,
                "planning_samples_cnt": planning_cnt,
-               "reward_model_eval_samples_cnt": reward_model_eval_cnt,
                'action_stats':act_stats}, f, indent=2)
 
 print(f'save {len(samples)} samples to {save_file.replace(".json", "_sample.json")}')
@@ -664,21 +715,3 @@ with open(save_file.replace(".json", "_sample.json"), "w") as f:
 print(f"save {len(samples)} samples to {save_file}")
 with open(save_file, "w") as f:
     json.dump(samples, f, indent=2)
-# with open("androidcontrol_apps_1.json", "w") as f:
-#     json.dump({k: list(v) for k,v in apps.items()}, f)
-
-if REWARDMODEL_EVAL:
-    save_file = os.path.join(SAVE_ROOT, f"{DATASET_NAME}-{SPLIT}_rmeval_s{SCALE}_{len(rewardmodel_eval_samples)}.json")
-    with open(save_file.replace(".json", "_sample.json"), "w") as f:
-        json.dump(random.sample(rewardmodel_eval_samples,64), f, indent=2)
-    
-    with open(save_file, "w") as f:
-        json.dump(rewardmodel_eval_samples, f, indent=2)
-
-if OUTCOME_REWARDMODEL_EVAL:
-    save_file = os.path.join(SAVE_ROOT, f"{DATASET_NAME}-{SPLIT}_outcomermeval_s{SCALE}_{len(outcome_rewardmodel_eval_samples)}.json")
-    with open(save_file.replace(".json", "_sample.json"), "w") as f:
-        json.dump(random.sample(outcome_rewardmodel_eval_samples, 64), f, indent=2)
-
-    with open(save_file, "w") as f:
-        json.dump(outcome_rewardmodel_eval_samples, f)

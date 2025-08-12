@@ -1,299 +1,467 @@
-# 给AIW生成以下类型任务：1. 给定图像、任务、历史动作，预测下一动作的决策过程；2. 给定当前click意图，预测gnd坐标
-import json, os, re, random, cv2, magic, numpy as np
-from tqdm import tqdm
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from task_prompt_lib import *
-from collections import defaultdict
-from datasets import Dataset
+"""
+Build AITW dataset variants.
+
+Generates two task types:
+1) Given image, global task and history, predict next action plan.
+2) Given current click intent, predict ground-truth coordinates.
+
+This module emphasizes clarity, type safety, and robust I/O.
+"""
+
+from __future__ import annotations
+
 import ast
+import json
+import logging
+import os
+import random
+import re
+import sys
+from collections import defaultdict
+from typing import Any, Dict, List, Sequence, Tuple
 
-from misc import generate_negative_action_plans, keep_unique_actions, lower_first_letter
+import cv2  # type: ignore
+from datasets import Dataset  # type: ignore
+from tqdm import tqdm  # type: ignore
 
-DATASET_NAME = 'AITW'
+# Make local libs importable
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-ROOT = "/mnt/shared-storage/groups/pretrain2/lhx/ui_data/AITW"
-SCALE=1000
-SPLIT = ['train', 'val', 'trainval', 'test'][2]
+from misc import keep_unique_actions, lower_first_letter  # noqa: E402
+from task_prompt_lib import *  # noqa: E402, F403
 
-APPS = ['all', 'general', 'install', 'googleapps', 'single', 'webshopping'][0]
-ONLY_ACTION = 'click'# 'enter'
-PUSH2HUB = False
-PLANNING = False
-INTENTGND = True; POINT_FORMAT = ['plain', 'qwen2', 'florence'][0]
 
-REWARDMODEL_EVAL = False
+# ------------------------------
+# Configuration
+# ------------------------------
 
-USE_ACTION_REFEXP = False
+DATASET_NAME: str = "AITW"
 
-DEVICE_TAG = 'Android'
+ROOT: str = "/mnt/vdb1/hongxin_li//AITW/"
+SAVE_DIR: str = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp"
 
-aitw_imgs_dir =  os.path.join(ROOT, "aitw_images")
+SCALE: int = 1000
+SPLIT: str = ["train", "val", "trainval", "test"][2]
 
-split_name = f"aitw_data_{SPLIT}"
+APPS: str = ["all", "general", "install", "googleapps", "single", "webshopping"][0]
 
-def make_aitw_data():
-    if SPLIT == 'trainval':
-        aitw_data = []
-        for v in json.load(open(f'{ROOT}/aitw_data_train.json', 'r')).values(): aitw_data.extend(v)
-        for v in json.load(open(f'{ROOT}/aitw_data_val.json', 'r')).values(): aitw_data.extend(v)
-    else:
-        aitw_data = json.load(open(f'{ROOT}/{split_name}.json', 'r'))
+ONLY_ACTION: str = "click"  # Example: 'click' or '' to allow all
+PUSH2HUB: bool = False
+PLANNING: bool = False
+INTENTGND: bool = True
 
-        aitw_data = aitw_data["general"] + aitw_data["single"] + aitw_data["webshopping"] + \
-                  aitw_data["install"] + aitw_data["googleapps"]
+POINT_FORMAT: str = ["plain", "qwen2", "florence"][0]
 
-    planning_cnt = intentgnd_cnt = reward_model_eval_cnt = 0
-    samples, rewardmodel_eval_samples, invalid_samples = [], [], []
+USE_ACTION_REFEXP: bool = True # Set as True when generating Qwen2-format training samples
 
-    for ep_id, episode in tqdm(enumerate(aitw_data), total=len(aitw_data), desc=f'{ROOT}/{split_name}.json'):
-        step_instructions = [x['action_addition'].replace("scroll down", "swipe up").replace("scroll up", "swipe down") .replace("scroll left", "swipe right").replace("scroll right", "swipe left") for x in episode]
+DEVICE_TAG: str = "Android"
 
-        # 把存在多个重复动作的轨迹去掉
-        if SPLIT != 'test':
-            same_cnt = 0; last_action = ''; is_invalid_ep = False
-            for step in episode:
-                if step['action_addition'] == last_action:
-                    same_cnt += 1
-                else:
-                    same_cnt = 0
-                if same_cnt >= 2:
-                    is_invalid_ep = True
-                    break
-                last_action = step['action_addition']
-            
-            if is_invalid_ep:
-                invalid_samples.extend([f"{x['ep_id']}-{x['step']}" for x in episode])
-                continue
-        
-        for step_idx, step_info in enumerate(episode):
-            img_filename = step_info["img_filename"] + '.png'
-            img_path = os.path.join(aitw_imgs_dir, img_filename)
-            
-            W, H = list(map(int, re.search('(\d+) x (\d+)', magic.from_file(img_path)).groups(1)))
+AITW_IMAGES_DIR: str = os.path.join(ROOT, "aitw_images")
+SPLIT_NAME: str = f"aitw_data_{SPLIT}"
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------
+# Utilities
+# ------------------------------
+
+def _load_split(root: str, split: str) -> List[List[Dict[str, Any]]]:
+    """Load AITW split and return a list of episodes."""
+    if split == "trainval":
+        episodes: List[List[Dict[str, Any]]] = []
+        for value in json.load(open(os.path.join(root, "aitw_data_train.json"), "r")).values():
+            episodes.extend(value)  # type: ignore[arg-type]
+        for value in json.load(open(os.path.join(root, "aitw_data_val.json"), "r")).values():
+            episodes.extend(value)  # type: ignore[arg-type]
+        return episodes
+
+    split_payload: Dict[str, List[List[Dict[str, Any]]]] = json.load(
+        open(os.path.join(root, f"{SPLIT_NAME}.json"), "r")
+    )
+    # Merge all app categories in a fixed order for determinism
+    merged: List[List[Dict[str, Any]]] = (
+        split_payload.get("general", [])
+        + split_payload.get("single", [])
+        + split_payload.get("webshopping", [])
+        + split_payload.get("install", [])
+        + split_payload.get("googleapps", [])
+    )
+    return merged
+
+
+def _episode_has_excessive_repeats(episode: Sequence[Dict[str, Any]], threshold: int = 2) -> bool:
+    """Detect trajectories with a repeated identical action >= threshold times in a row."""
+    consecutive_repeats = 0
+    last_action = ""
+    for step in episode:
+        current_action = step["action_addition"]
+        if current_action == last_action:
+            consecutive_repeats += 1
+        else:
+            consecutive_repeats = 0
+        if consecutive_repeats >= threshold:
+            return True
+        last_action = current_action
+    return False
+
+
+def _compute_image_size(img_path: str) -> Tuple[int, int]:
+    """Return (width, height) for the given image path.
+    
+    Falls back to magic library if cv2 fails, maintaining original behavior.
+    """
+    # Try cv2 first (more reliable)
+    try:
+        image = cv2.imread(img_path)
+        if image is not None:
+            height, width = image.shape[:2]
+            return width, height
+    except Exception:
+        pass
+    
+    # Fallback to magic library (original method)
+    try:
+        import magic
+        size_match = re.search(r'(\d+) x (\d+)', magic.from_file(img_path))
+        if size_match:
+            return int(size_match.group(1)), int(size_match.group(2))
+    except Exception:
+        pass
+    
+    raise FileNotFoundError(f"Failed to read image dimensions: {img_path}")
+
+
+def _scale_point_to_grid(point01: Tuple[float, float], scale: int) -> Tuple[int, int]:
+    sx = max(0, min(scale - 1, round(point01[0] * scale)))
+    sy = max(0, min(scale - 1, round(point01[1] * scale)))
+    return sx, sy
+
+
+def _build_history(normalized_step_instructions: Sequence[str], until_index: int) -> str:
+    # Deduplicate while preserving the last MAX_PREV_ACT
+    _, deduped = keep_unique_actions(normalized_step_instructions[:until_index])
+    retained = deduped[-MAX_PREV_ACT:]
+    if not retained:
+        return "None"
+    start_idx = max(1, len(deduped) - MAX_PREV_ACT + 1)
+    return " ".join(
+        f"Step {i}. {instr.strip(' .')}." for i, instr in enumerate(retained, start=start_idx)
+    )
+
+
+def _action_from_step(
+    step_info: Dict[str, Any],
+    *,
+    scale: int,
+) -> Tuple[str, str, str]:
+    """Return (action_str, action_refexp, resolved_action_type_text).
+
+    resolved_action_type_text may be adjusted (e.g., scroll -> swipe direction)
+    """
+    action_type_text: str = step_info["action_type_text"]
+    from_point: Tuple[float, float] = step_info["touch"]
+    to_point: Tuple[float, float] = step_info["lift"]
+
+    if action_type_text == "click":
+        sx, sy = _scale_point_to_grid(from_point, scale)
+        action_str = CLICK_TEMPLATE.format(target_x=sx, target_y=sy)  # type: ignore[name-defined]
+        action_intent = step_info["action_addition"].strip(" .")
+        click_target = action_intent[action_intent.find(" ") + 1 :]
+        action_refexp = random.choice(ACTION_PREFIXES[action_type_text]["specific"]) + f' the element "{click_target}"'  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if "scroll" in action_type_text:
+        sx, sy = _scale_point_to_grid(from_point, scale)
+        scroll_direction = action_type_text.split()[-1]
+        if scroll_direction in ["down", "up"]:
+            shift = to_point[1] - from_point[1]
+            shift_abs = abs(shift)
+            swipe_direction = "down" if shift > 0 else "up"
+        else:
+            shift = to_point[0] - from_point[0]
+            shift_abs = abs(shift)
+            swipe_direction = "right" if shift > 0 else "left"
+        step_info["action_addition"] = f"swipe {swipe_direction}"
+        distance = discretize_dist(shift_abs)  # type: ignore[name-defined]
+        action_str = SWIPE_TEMPLATE.format(  # type: ignore[name-defined]
+            start_x=sx, start_y=sy, direction=swipe_direction, distance=distance
+        )
+        action_refexp = random.choice(SWIPE_PHRASES).format(direction=swipe_direction)  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "type":
+        text_raw = step_info["type_text"]
+        # Normalize quotes and escapes
+        if text_raw.count('"') % 2 != 0:
+            text_raw = text_raw.strip('"')
+        if text_raw.count("'") % 2 != 0:
+            text_raw = text_raw.strip("'")
+        text = text_raw.strip(" \\").replace("\n", "\\n").replace('"', '\\"')
+        if not text:
+            return "", "", action_type_text
+        action_str = INPUT_TEMPLATE.format(text=text)  # type: ignore[name-defined]
+        action_refexp = random.choice(INPUT_ACTION_PREFIXES_WITH_TEXT["specific"]).format(  # type: ignore[name-defined]
+            text=text, target="the text box"
+        )
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "status task complete":
+        action_str = STATUS_TEMPLATE.format(goal_status="successful", answer="")  # type: ignore[name-defined]
+        action_refexp = random.choice(TASK_STATUS_SENTENCES["successful"])  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "status task impossible":
+        action_str = STATUS_TEMPLATE.format(goal_status="infeasible", answer="")  # type: ignore[name-defined]
+        action_refexp = random.choice(TASK_STATUS_SENTENCES["infeasible"])  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "press back":
+        action_str = NAVIGATE_BACK_TEMPLATE  # type: ignore[name-defined]
+        action_refexp = random.choice(NAVIGATE_BACK_PREFIXES)  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "press home":
+        action_str = NAVIGATE_HOME_TEMPLATE  # type: ignore[name-defined]
+        action_refexp = random.choice(NAVIGATE_HOME_PREFIXES)  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    if action_type_text == "press enter":
+        action_str = PRESSKEY_TEMPLATE.format(key="Enter")  # type: ignore[name-defined]
+        action_refexp = random.choice(PRESSKEY_PREFIXES["Enter"])  # type: ignore[name-defined]
+        return action_str, action_refexp, action_type_text
+
+    raise ValueError(f"Unknown action type: {action_type_text}")
+
+
+def make_aitw_data() -> None:
+    episodes = _load_split(ROOT, SPLIT)
+
+    planning_count = 0
+    intentgnd_count = 0
+    samples: List[Dict[str, Any]] = []
+    invalid_samples: List[str] = []
+
+    for ep_index, episode in tqdm(
+        enumerate(episodes), total=len(episodes), desc=f"{ROOT}/{SPLIT_NAME}.json"
+    ):
+        # Normalize scroll wording for history and stats to keep behavior parity
+        step_instructions = [
+            x["action_addition"].replace("scroll down", "swipe up")
+            .replace("scroll up", "swipe down")
+            .replace("scroll left", "swipe right")
+            .replace("scroll right", "swipe left")
+            for x in episode
+        ]
+
+        # Drop episodes with too many consecutive identical actions (non-test only)
+        if SPLIT != "test" and _episode_has_excessive_repeats(episode):
+            invalid_samples.extend([f"{x['ep_id']}-{x['step']}" for x in episode])
+            continue
+
+        for step_index, step_info in enumerate(episode):
+            img_filename = f"{step_info['img_filename']}.png"
+            img_path = os.path.join(AITW_IMAGES_DIR, img_filename)
 
             if not os.path.exists(img_path):
-                print('image not found')
+                logger.warning("Image not found: %s", img_path)
                 continue
-            # if len(img_filename) > 100:     # several image with long filename lead to error in linux, just jump it
-            short_img_path = f'{DATASET_NAME}/' + img_path.split('aitw_images/')[1]
 
-            if step_idx < len(episode)-1:
-                nextimg_path = os.path.join(aitw_imgs_dir, episode[step_idx+1]["img_filename"] + '.png')
-                short_nextimg_path = f'{DATASET_NAME}/' + nextimg_path.split('aitw_images/')[1]
-            else: short_nextimg_path = short_img_path
+            try:
+                width, height = _compute_image_size(img_path)
+            except FileNotFoundError:
+                logger.warning("Failed to read image: %s", img_path)
+                continue
 
-            action_type = step_info['action_type_text']
-            from_point =  step_info['touch']
-            to_point =  step_info['lift']
+            short_img_path = f"{DATASET_NAME}/" + img_path.split("aitw_images/")[1]
 
-            neg_actions = None
-            boxes = []
-            for anno_i in range(0,len(step_info['annot_position']),4):
-                anno_y, anno_x, anno_h, anno_w = step_info['annot_position'][anno_i:anno_i+4]
-                anno_x1, anno_y1 = round(anno_x*W), round(anno_y*H)
-                anno_x2, anno_y2 = round((anno_x+anno_w)*W), round((anno_y+anno_h)*H)
-                boxes.append([anno_x1, anno_y1, anno_x2, anno_y2])
-
-            if action_type == 'click':
-                start_x, start_y = list(map(lambda x: max(0, min(SCALE-1, round(x*SCALE))), from_point))
-
-                action_str = CLICK_TEMPLATE.format(target_x=start_x, target_y=start_y)
-
-                action_intent = step_info['action_addition'].strip(' .')
-                click_target = action_intent[action_intent.find(' ')+1:]
-                action_refexp = random.choice(ACTION_PREFIXES[action_type]['specific']) + f' the element "{click_target}"'
-
-                if False:
-                    before = cv2.imread(img_path)
-                    H,W = before.shape[:2]
-                    center_x, center_y = round(from_point[0]*W), round(from_point[1]*H)
-                    print(step_info['action_addition'], from_point)
-                    cv2.circle(before, (center_x, center_y), 5, (0, 0, 255), -1)
-                    
-                    if True:
-                        for anno_i in range(0,len(step_info['annot_position']),4):
-                            anno_y, anno_x, anno_h, anno_w = step_info['annot_position'][anno_i:anno_i+4]
-                            anno_x1, anno_y1 = round(anno_x*W), round(anno_y*H)
-                            anno_x2, anno_y2 = round((anno_x+anno_w)*W), round((anno_y+anno_h)*H)
-                            cv2.rectangle(before, (anno_x1, anno_y1), (anno_x2, anno_y2), (0, 255, 0), 2)
-                    cv2.imwrite("test.png", before)
-                    1+1
-                # intentgnd
-                if INTENTGND and SPLIT != 'test':
-                    intent = lower_first_letter(action_refexp if USE_ACTION_REFEXP else action_intent)
-                    sample = make_intentgnd_sample(task_id=f"autogui_{DATASET_NAME}_intentgnd_{step_info['ep_id']}-{step_info['step']}", intent=intent, loc=(start_x, start_y), output_tag=WITHPOINT_TAG_LONG, point_format=POINT_FORMAT)
-                    sample['step_info'], sample['task_attr'], sample['image'] = step_info, intent, short_img_path
-                    samples.append(sample); intentgnd_cnt += 1
-
-                if False:
-                    img = cv2.imread(img_path)
-                    for box in boxes:
-                        cv2.rectangle(img, box[:2], box[2:], color=(0,255,0), thickness=3)
-                    cv2.circle(img, [round(from_point[0]*W),round(from_point[1]*H)], color=(0,255,0), radius=8, thickness=3)
-                    cv2.imwrite('test.png', img)
-                        
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='click', W=W, H=H, scale=SCALE, gt_center=[from_point[0]*W, from_point[1]*H], boxes=boxes)
-
-            elif 'scroll' in action_type:
-                start_x, start_y = list(map(lambda x: max(0, min(SCALE-1, round(x*SCALE))), from_point))
-                scroll_direction = action_type.split()[-1]
-                
-                if scroll_direction in ['down', 'up']:
-                    shift = to_point[1] - from_point[1]
-                    shift_abs = abs(shift)
-                    swipe_direction = 'down' if shift > 0 else 'up'
-                else:
-                    shift = to_point[0] - from_point[0]
-                    shift_abs = abs(shift)
-                    swipe_direction = 'right' if shift > 0 else 'left'
-                
-                step_info['action_addition'] = f"swipe {swipe_direction}"
-                distance = discretize_dist(shift_abs)
-
-                action_str = SWIPE_TEMPLATE.format(start_x=start_x, start_y=start_y, direction=swipe_direction, distance=distance)
-                action_refexp = random.choice(SWIPE_PHRASES).format(direction=swipe_direction)
-
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='swipe', W=W, H=H, scale=SCALE, gt_center=[round(from_point[0]*W), round(from_point[1]*H)],  boxes=boxes, direction=swipe_direction)
-                        
-                if False:
-                    cur_step_id = img_filename.split('_')[-1][:-4]
-                    before = cv2.imread(img_path)
-                    after = cv2.imread(os.path.join(aitw_imgs_dir, img_filename.replace(f"{cur_step_id}.png", f"{int(cur_step_id)+1}.png")))
-                    if after is not None:
-                        print(step_info['action_addition'])
-                        print(from_point, to_point)
-                        print(action_str+'\n')
-                        cv2.imwrite("test.png", np.concatenate([before, after], axis=1))
-            elif action_type == 'type':
-                text = step_info['type_text']
-                if text.count('"') % 2 != 0: text = text.strip('"')
-                if text.count("'") % 2 != 0: text = text.strip("'")
-                text = step_info['type_text'].strip(' \\').replace("\n", "\\n").replace('"', '\\"')
-                
-                if not text:
-                    continue
-
-                action_str = INPUT_TEMPLATE.format(text=text)
-                action_refexp = random.choice(INPUT_ACTION_PREFIXES_WITH_TEXT['specific']).format(text=text, target="the text box")
-
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='input_text', W=W, H=H, scale=SCALE, boxes=boxes, text=text)
-
-            elif action_type == 'status task complete':
-                action_str = STATUS_TEMPLATE.format(goal_status='successful', answer='')
-                action_refexp = random.choice(TASK_STATUS_SENTENCES['successful'])
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='status', W=W, H=H, scale=SCALE, boxes=boxes, goal_status='successful')
-            elif action_type == 'status task impossible':
-                action_str = STATUS_TEMPLATE.format(goal_status='infeasible', answer='')
-                action_refexp = random.choice(TASK_STATUS_SENTENCES['infeasible'])
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='status', W=W, H=H, scale=SCALE, boxes=boxes, goal_status='infeasible')
-            elif action_type == 'press back':
-                action_str = NAVIGATE_BACK_TEMPLATE
-                action_refexp = random.choice(NAVIGATE_BACK_PREFIXES)
-            elif action_type == 'press home':
-                action_str = NAVIGATE_HOME_TEMPLATE
-                action_refexp = random.choice(NAVIGATE_HOME_PREFIXES)
-            elif action_type == 'press enter':
-                action_str = PRESSKEY_TEMPLATE.format(key='Enter')
-                action_refexp = random.choice(PRESSKEY_PREFIXES['Enter'])
+            if step_index < len(episode) - 1:
+                next_img_path = os.path.join(
+                    AITW_IMAGES_DIR, f"{episode[step_index + 1]['img_filename']}.png"
+                )
+                short_next_img_path = f"{DATASET_NAME}/" + next_img_path.split("aitw_images/")[1]
             else:
-                raise ValueError(f"Unknown action type: {action_type}")
+                short_next_img_path = short_img_path
 
-            if len(ONLY_ACTION) > 0 and ONLY_ACTION not in action_str: continue
+            try:
+                action_str, action_refexp, action_type_text = _action_from_step(
+                    step_info, scale=SCALE
+                )
+            except ValueError as err:
+                logger.error("%s", err)
+                continue
 
-            # old: history_str = 'None' if step_idx <= 1 else ' '.join(f'Step {i}. {step.strip(" .")}.' for i, step in enumerate(step_instructions[max(0,step_idx-MAX_PREV_ACT):step_idx], start=1))
+            # Skip empty actions (e.g., empty type text)
+            if not action_str:
+                continue
 
-            clean_prev_step_instructions = keep_unique_actions(step_instructions[:step_idx])
-            retained_history = clean_prev_step_instructions[-MAX_PREV_ACT:]
-            history_str = ' '.join(f"Step {i}. {instruc.strip(' .')}." for i, instruc in enumerate(retained_history, start=max(1,len(clean_prev_step_instructions) - MAX_PREV_ACT+1))) if len(retained_history) > 0 else 'None'
-                
-            action_type = ast.literal_eval(action_str)['action_type']
+            if len(ONLY_ACTION) > 0 and ONLY_ACTION not in action_str:
+                continue
 
-            if USE_ACTION_REFEXP:
-                action_str = f"{QWEN_OBJ_REF_TAG_START}{action_refexp}{QWEN_OBJ_REF_TAG_END}\n{action_str}"
+            history_str = _build_history(step_instructions, step_index)
 
-            if APPS != 'all' and img_filename.split('/')[0] != APPS: continue
+            # Derive structured action type from the action_str JSON
+            action_type = ast.literal_eval(action_str)["action_type"] if action_str else ""
+
+            if USE_ACTION_REFEXP and action_str:
+                action_str = f"{QWEN_OBJ_REF_TAG_START}{action_refexp}{QWEN_OBJ_REF_TAG_END}\n{action_str}"  # type: ignore[name-defined]
+
+            if APPS != "all" and img_filename.split("/")[0] != APPS:
+                continue
+
             if PUSH2HUB:
-                print(len(samples), img_filename)
-                samples.append({'image': img_filename, 'step': step_info, 'history': step_instructions[:step_idx], 'step_instruction': step_info['action_addition'], 'action_type': action_type, 'action_refexp': action_refexp})
+                samples.append(
+                    {
+                        "image": img_filename,
+                        "step": step_info,
+                        "history": step_instructions[:step_index],
+                        "step_instruction": step_info["action_addition"],
+                        "action_type": action_type,
+                        "action_refexp": action_refexp,
+                    }
+                )
             else:
-                gt_action = "Action: {action}".format(action=action_str)
+                gt_action = f"Action: {action_str}"
 
                 if PLANNING:
-                    # planning
-                    sample = make_actionplanning_sample(
+                    # H
+                    sample = make_actionplanning_sample(  # type: ignore[name-defined]
                         task_id=f"autogui_{DATASET_NAME}_planning_{step_info['ep_id']}-{step_info['step']}-H",
-                        global_task=step_info['goal'],
+                        global_task=step_info["goal"],
                         history=history_str,
                         gt_action=gt_action,
                         with_cot=False,
                         device_tag=DEVICE_TAG,
-                        use_action_refexp=USE_ACTION_REFEXP)
-                    
-                    sample['action_type'], sample['step_info'], sample['image'], sample['next_image'], sample['history'], sample['step_instruction'], sample['action_refexp'] = action_type, step_info, short_img_path, short_nextimg_path, step_instructions[:step_idx], step_info['action_addition'], action_refexp
-                    samples.append(sample); planning_cnt += 1
+                        use_action_refexp=USE_ACTION_REFEXP,
+                    )
+                    sample.update(
+                        {
+                            "action_type": action_type,
+                            "step_info": step_info,
+                            "image": short_img_path,
+                            "next_image": short_next_img_path,
+                            "history": step_instructions[:step_index],
+                            "step_instruction": step_info["action_addition"],
+                            "action_refexp": action_refexp,
+                        }
+                    )
+                    samples.append(sample)
+                    planning_count += 1
 
-                    sample = make_actionplanning_sample(
+                    # HL
+                    sample = make_actionplanning_sample(  # type: ignore[name-defined]
                         task_id=f"autogui_{DATASET_NAME}_planning_{step_info['ep_id']}-{step_info['step']}-HL",
-                        global_task=step_info['goal'],
+                        global_task=step_info["goal"],
                         history=history_str,
                         gt_action=gt_action,
                         step_instruction=f"The next step instruction: {step_info['action_addition']}\n",
                         with_cot=False,
                         device_tag=DEVICE_TAG,
-                        use_action_refexp=USE_ACTION_REFEXP)
-                    
-                    sample['action_type'], sample['step_info'], sample['image'], sample['next_image'], sample['history'], sample['step_instruction'], sample['action_refexp'] = action_type, step_info, short_img_path, short_nextimg_path, step_instructions[:step_idx], step_info['action_addition'], action_refexp
+                        use_action_refexp=USE_ACTION_REFEXP,
+                    )
+                    sample.update(
+                        {
+                            "action_type": action_type,
+                            "step_info": step_info,
+                            "image": short_img_path,
+                            "next_image": short_next_img_path,
+                            "history": step_instructions[:step_index],
+                            "step_instruction": step_info["action_addition"],
+                            "action_refexp": action_refexp,
+                        }
+                    )
+                    samples.append(sample)
+                    planning_count += 1
 
-                    samples.append(sample); planning_cnt += 1
+                # Intent grounding samples (non-test only, and only for click)
+                if INTENTGND and SPLIT != "test" and action_type_text == "click":
+                    sx, sy = _scale_point_to_grid(step_info["touch"], SCALE)
+                    intent_text = lower_first_letter(
+                        action_refexp if USE_ACTION_REFEXP else step_info["action_addition"]
+                    )
+                    sample = make_intentgnd_sample(  # type: ignore[name-defined]
+                        task_id=f"autogui_{DATASET_NAME}_intentgnd_{step_info['ep_id']}-{step_info['step']}",
+                        intent=intent_text,
+                        loc=(sx, sy),
+                        output_tag=WITHPOINT_TAG_LONG,  # type: ignore[name-defined]
+                        point_format=POINT_FORMAT,
+                    )
+                    sample["step_info"], sample["task_attr"], sample["image"] = (
+                        step_info,
+                        intent_text,
+                        short_img_path,
+                    )
+                    samples.append(sample)
+                    intentgnd_count += 1
 
-            if REWARDMODEL_EVAL:
-                if neg_actions is None:
-                    neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, boxes=boxes)
+    app_suffix = "" if APPS == "all" else f"-{APPS}"
+    act_limit_suffix = "" if len(ONLY_ACTION) == 0 else f"-{ONLY_ACTION}"
 
-                neg_sample = {'id': f'autogui_{DATASET_NAME}_rewardmodeleval_{reward_model_eval_cnt}', "image": short_img_path, "next_image": short_nextimg_path, 'ep_id': step_info['ep_id'], 'step_id': step_idx, 'task': step_info['goal'], 'step_instruction': step_info['action_addition'], "action_type": action_type, "history": step_instructions[:step_idx], 'gt_action': action_str, 'neg_actions': neg_actions, "wxh": f"{W}x{H}"}
-                rewardmodel_eval_samples.append(neg_sample); reward_model_eval_cnt += 1
-
-    app = '' if APPS == 'all' else f'-{APPS}'
-    act_limit = '' if len(ONLY_ACTION) == 0 else f'-{ONLY_ACTION}'
-            
     if PUSH2HUB:
         dataset = Dataset.from_list(samples)
-        dataset.push_to_hub(f"HongxinLi/AITW_test{app}{act_limit}_v2", private=False, token='', split=SPLIT)
-    else:
-        action_stats = defaultdict(int)
-        for x in samples:
-            if 'planning' not in x['id']: continue
-            action_stats[re.search(r'"action_type":\s*"([^"]+)"', x['conversations'][1]['value']).group(1)] += 1
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            logger.error("HF_TOKEN environment variable not set; cannot push to hub.")
+            return
+        dataset.push_to_hub(
+            f"HongxinLi/AITW_test{app_suffix}{act_limit_suffix}_v2",
+            private=False,
+            token=hf_token,
+            split=SPLIT,
+        )
+        return
 
-        report = f"Total samples: {len(samples)+len(invalid_samples)} Valid samples: {len(samples)} | #Unique imgs: {len(set(x['image'] for x in samples))} | planning: {planning_cnt} | intentgnd: {intentgnd_cnt}"
-        print(report)
-        save_to_dir = f"/data/hongxin_li/scaling_exp/{DATASET_NAME}_processed"
-        os.makedirs(save_to_dir, exist_ok=True)
-        save_to_file = os.path.join(save_to_dir, f"{DATASET_NAME}{app}{act_limit}_{SPLIT}{'_wActRef' if PLANNING and USE_ACTION_REFEXP else ''}{'_IntengGnd' if INTENTGND else ''}_s{SCALE}_{len(samples)}.json")
+    action_stats: Dict[str, int] = defaultdict(int)
+    for item in samples:
+        if "planning" not in item.get("id", ""):
+            continue
+        match = re.search(r'"action_type":\s*"([^"]+)"', item["conversations"][1]["value"])  # type: ignore[index]
+        if match:
+            action_stats[match.group(1)] += 1
 
-        print(f"save {len(samples)} samples to {save_to_file}")
-        with open(save_to_file.replace(".json", "_stats.json"), "w") as f:
-            json.dump({"total_sample_cnt": len(samples)+len(invalid_samples), "valid_sample_cnt": len(samples), "planning": planning_cnt, "action_stats": action_stats, "intentgnd": intentgnd_cnt, "invalid_samples": invalid_samples}, f, indent=2)
+    report = (
+        f"Total samples: {len(samples)+len(invalid_samples)} Valid samples: {len(samples)} | "
+        f"#Unique imgs: {len(set(x['image'] for x in samples if 'image' in x))} | "
+        f"planning: {planning_count} | intentgnd: {intentgnd_count}"
+    )
+    logger.info(report)
 
-        print(f'save {len(samples)} samples to {save_to_file.replace(".json", "_sample.json")}')
-        with open(save_to_file.replace(".json", "_sample.json"), "w") as f:
-            json.dump(random.sample(samples, min(len(samples),160)), f, indent=2)
+    save_dir = f"{SAVE_DIR}/{DATASET_NAME}_processed"
+    os.makedirs(save_dir, exist_ok=True)
+    save_file = os.path.join(
+        save_dir,
+        f"{DATASET_NAME}{app_suffix}{act_limit_suffix}_{SPLIT}"
+        f"{'_wActRef' if PLANNING and USE_ACTION_REFEXP else ''}"
+        f"{'_IntengGnd' if INTENTGND else ''}_s{SCALE}_{len(samples)}.json",
+    )
 
-        with open(save_to_file, "w") as f:
-            json.dump(samples, f, indent=2)
+    stats_path = save_file.replace(".json", "_stats.json")
+    sample_path = save_file.replace(".json", "_sample.json")
 
-    if REWARDMODEL_EVAL:
-        save_file = os.path.join(save_to_dir, f"{DATASET_NAME}-{SPLIT}_rmeval_s{SCALE}_{len(rewardmodel_eval_samples)}.json")
-        with open(save_file.replace(".json", "_sample.json"), "w") as f:
-            json.dump(random.sample(rewardmodel_eval_samples,128), f, indent=2)
-        
-        with open(save_file, "w") as f:
-            json.dump(rewardmodel_eval_samples, f)
+    with open(stats_path, "w") as f:
+        json.dump(
+            {
+                "total_sample_cnt": len(samples) + len(invalid_samples),
+                "valid_sample_cnt": len(samples),
+                "planning": planning_count,
+                "action_stats": action_stats,
+                "intentgnd": intentgnd_count,
+                "invalid_samples": invalid_samples,
+            },
+            f,
+            indent=2,
+        )
+    logger.info("Saved stats to %s", stats_path)
 
-make_aitw_data()
+    with open(sample_path, "w") as f:
+        json.dump(random.sample(samples, min(len(samples), 160)), f, indent=2)
+    logger.info("Saved sample to %s", sample_path)
+
+    with open(save_file, "w") as f:
+        json.dump(samples, f, indent=2)
+    logger.info("Saved %d samples to %s", len(samples), save_file)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    make_aitw_data()

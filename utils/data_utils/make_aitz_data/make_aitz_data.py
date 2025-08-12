@@ -1,47 +1,101 @@
-# 给AITZ生成以下类型任务：1. 给定图像、任务、历史动作，预测下一动作的推理、决策过程；2. 给定图像、任务、历史动作、当前click步骤意图，预测gnd坐标；3. 图像描述
+"""
+AITZ dataset preprocessing utilities.
 
-# epid: 17693907265291426996 step 0 有标注错误：coat_action_think里说要swipe down from the top of the screen to access the quick settings panel，但实际上执行的动作是'coat_action_desc' = 'swipe up'
+This module prepares training samples for multiple tasks:
+1) Given image, task, and history, predict the next action with reasoning.
+2) Given image, task, history, and current click intent, predict ground coords.
+3) (Optional) UI screen captioning.
 
-# epid: 9088265727317240175 steps 8-10 标注错误。UI画面显示此时做的操作是通过swipe来移动输入光标，但gpt生成的coat_action_result没有根据正确的意图来总结动作结果。
+Notes from dataset inspection (retained from original script):
+- epid: 17693907265291426996 step 0 annotation issue: the thought says "swipe down from the top of the screen to access quick settings," but the action description is actually "swipe up." 
+- epid: 9088265727317240175 steps 8-10 annotation issue: the UI shows using a swipe to move the text cursor, but the generated action result summary did not reflect that intent.
+- epid: 17652164182256576003 step 1: the swipe is used to drag a slider; future action space should allow fine-grained dragging.
+- AITZ images have relatively low resolution; resizing is unnecessary.
+"""
 
-# epid: 17652164182256576003 step 1。这里的swipe用于拖动滑块，未来的动作空间应该允许这种精细拖动操作
+from __future__ import annotations
 
-# AITZ的图像分辨率都比较小，不用resize
-
-import json, os, random, cv2, glob, re, magic, numpy as np
-from tqdm import tqdm
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from task_prompt_lib import *
-from collections import defaultdict
 import ast
+import json
+import os
+import random
+import re
+import sys
+import logging
+from collections import defaultdict
+from typing import List
 
-from misc import generate_negative_action_plans, keep_unique_actions
+import glob
+import cv2
+import magic
+import numpy as np
+from tqdm import tqdm
+
+# Ensure sibling imports resolve at runtime
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from task_prompt_lib import *  # noqa: F403,F401
+
+from misc import generate_negative_action_plans, keep_unique_actions  # noqa: F401
 
 
-DATASET_NAME = 'AITZ'
-DRAW=False
-ROOT = "/mnt/vdb1/hongxin_li/AITZ"
-SCALE=1000
-SPLIT = ['train', 'test'][0]
+DATASET_NAME: str = 'AITZ'
+DRAW: bool = False
+ROOT: str = "/mnt/vdb1/hongxin_li/AITZ"
+SAVE_DIR: str = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp"
+SCALE: int = 1000
+SPLIT: str = ['train', 'test'][0]
 
-INTENTGND = False
-UICAPTION = False
-REWARDMODEL_EVAL = False
+INTENTGND: bool = False
+UICAPTION: bool = False
 
-USE_ACTION_REFEXP = True
+USE_ACTION_REFEXP: bool = True # Set as True when generating Qwen2-format training samples
 
-DEVICE_TAG = 'Android'
+DEVICE_TAG: str = 'Android'
 
-def make_aitz_data():
+
+def _safe_parse_ui_positions(ui_positions_str: str) -> List[List[int]]:
+    """Safely parse UI element bounding boxes from string to [x1, y1, x2, y2].
+
+    Expected input is a Python literal list of boxes in [y, x, h, w] format.
+    Uses ast.literal_eval first and falls back to eval to preserve legacy
+    behavior for non-literal strings.
+    """
+    try:
+        boxes_raw = ast.literal_eval(ui_positions_str)
+    except Exception:  # noqa: BLE001 - preserve behavior with broad except
+        logging.warning("Falling back to eval() for ui_positions parsing.")
+        boxes_raw = eval(ui_positions_str)
+
+    return [[p[1], p[0], p[1] + p[3], p[0] + p[2]] for p in boxes_raw]
+
+
+def _compute_history_string(step_instructions: List[str], step_idx: int) -> str:
+    """Build a compact deduplicated history string for current step."""
+    _, clean_prev = keep_unique_actions(step_instructions[:step_idx])
+    retained = clean_prev[-MAX_PREV_ACT:]
+    if not retained:
+        return 'None'
+    start_i = max(1, len(clean_prev) - MAX_PREV_ACT + 1)
+    return ' '.join(
+        f"Step {i}. {instr.strip(' .')}." for i, instr in enumerate(retained, start=start_i)
+    )
+
+def make_aitz_data() -> None:
+    """Generate AITZ training samples and write them to disk.
+
+    Iterates through all episode metadata files, builds action-planning samples
+    (with and without chain-of-thought), and optionally UI caption or intent
+    grounding samples. Outputs summary statistics and a small random subset for
+    quick inspection.
+    """
     data_dir = os.path.join(ROOT, SPLIT)
-    save_to_dir = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/{DATASET_NAME}_processed"
+    save_to_dir = os.path.join(SAVE_DIR, f"{DATASET_NAME}_processed")
 
     all_ep_meta_files = sorted(glob.glob(os.path.join(data_dir, "*", "*", "*.json")))
     
-    planning_cnt = uicaption_cnt = intentgnd_cnt = reward_model_eval_cnt = 0
+    planning_cnt = uicaption_cnt = intentgnd_cnt = 0
 
-    samples, rewardmodel_eval_samples = [], []
+    samples = []
     invalid_samples = []
 
     for ep_idx, ep_meta_file in tqdm(enumerate(all_ep_meta_files), total=len(all_ep_meta_files)):
@@ -64,9 +118,8 @@ def make_aitz_data():
             
             step_instructions.append(step_info['coat_action_desc'])
             
-            # load the elem positions
-            boxes = eval(step_info['ui_positions'])
-            boxes = [[p[1],p[0],p[1]+p[3],p[0]+p[2]] for p in boxes]
+            # Load UI element positions (used only when DRAW is True)
+            boxes = _safe_parse_ui_positions(step_info['ui_positions'])
 
             neg_actions = None
 
@@ -121,9 +174,6 @@ def make_aitz_data():
                         invalid_samples.append([step_info['image_path'].split('-')[-1][:-4], 'The action in the thought does not match the action taken'])
                         continue
 
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type='swipe', W=W, H=H, scale=SCALE, gt_center=[round(from_point[1]*W),round(from_point[0]*H)], boxes=boxes, direction=direction)
-
                     if DRAW:
                         cur_step_id = step_info['image_path'].split('_')[-1][:-4]
                         before = cv2.imread(os.path.join("/mnt/vdb1/hongxin_li/AITZ/train", step_info['image_path']))
@@ -149,9 +199,6 @@ def make_aitz_data():
                             cv2.rectangle(img, box[:2], box[2:], color=(0,255,0), thickness=3)
                         cv2.circle(img, [round(from_point[1]*W),round(from_point[0]*H)], color=(0,255,0), radius=8, thickness=3)
                         cv2.imwrite('test.png', img)
-                        
-                    if REWARDMODEL_EVAL:
-                        neg_actions = generate_negative_action_plans(gt_act_type='click', W=W, H=H, scale=SCALE, gt_center=[from_point[1]*W,from_point[0]*H], boxes=boxes)
 
             elif step_info['result_action_type'] == 3:
                 text = step_info['result_action_text'].strip()
@@ -165,14 +212,10 @@ def make_aitz_data():
                 action_str = INPUT_TEMPLATE.format(text=text)
                 action_refexp = random.choice(INPUT_ACTION_PREFIXES_WITH_TEXT['specific']).format(text=text, target="the text box")
 
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type='input_text', W=W, H=H, scale=SCALE, boxes=boxes, text=text)
             elif step_info['result_action_type'] == 10:
                 action_str = STATUS_TEMPLATE.format(goal_status='successful', answer='')
                 action_refexp = random.choice(TASK_STATUS_SENTENCES['successful'])
 
-                if REWARDMODEL_EVAL:
-                    neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, boxes=boxes, goal_status='successful')
             elif step_info['result_action_type'] == 5:
                 action_str = NAVIGATE_BACK_TEMPLATE
                 action_refexp = random.choice(NAVIGATE_BACK_PREFIXES)
@@ -189,9 +232,7 @@ def make_aitz_data():
             action_type = ast.literal_eval(action_str)['action_type']
 
             # Merge history
-            clean_prev_step_instructions = keep_unique_actions(step_instructions[:step_idx])
-            retained_history = clean_prev_step_instructions[-MAX_PREV_ACT:]
-            history_str = ' '.join(f"Step {i}. {instruc.strip(' .')}." for i, instruc in enumerate(retained_history, start=max(1,len(clean_prev_step_instructions) - MAX_PREV_ACT+1))) if len(retained_history) > 0 else 'None'
+            history_str = _compute_history_string(step_instructions, step_idx)
 
             if USE_ACTION_REFEXP:
                 action_str = f"{QWEN_OBJ_REF_TAG_START}{action_refexp}{QWEN_OBJ_REF_TAG_END}\n{action_str}"
@@ -226,13 +267,6 @@ def make_aitz_data():
             sample['action_type'], sample['step_info'], sample['step_instruction'], sample['action_refexp'], sample['image'], sample['next_image'], sample['history'] = action_type, step_info, step_info['coat_action_desc'], action_refexp, short_img_path, short_nextimg_path, step_instructions[:step_idx]
             samples.append(sample); planning_cnt += 1
 
-            if REWARDMODEL_EVAL:
-                if neg_actions is None:
-                    neg_actions = generate_negative_action_plans(gt_act_type=action_type, W=W, H=H, scale=SCALE, boxes=boxes)
-
-                neg_sample = {'id': f'autogui_{DATASET_NAME}_rewardmodeleval_{reward_model_eval_cnt}', "image": short_img_path, "next_image": short_nextimg_path, 'ep_id': step_info['episode_id'], 'step_id': step_idx, 'task': step_info['instruction'], 'step_instruction': step_info['coat_action_desc'], "action_type": action_type, "history": step_instructions[:step_idx], 'gt_action': action_str, 'neg_actions': neg_actions, "wxh": f"{W}x{H}"}
-                rewardmodel_eval_samples.append(neg_sample); reward_model_eval_cnt += 1
-
             # ui caption
             if UICAPTION:
                 sample = make_uicaption_sample(task_id=f"autogui_AITZ_uicaption_{step_info['episode_id']}-{step_info['step_id']}", ui_caption=step_info['coat_screen_desc'])
@@ -258,14 +292,6 @@ def make_aitz_data():
     print(f"save {len(samples)} samples to {save_to_file}")
     with open(save_to_file, "w") as f:
         json.dump(samples, f, indent=2)
-
-    if REWARDMODEL_EVAL:
-        save_file = os.path.join(save_to_dir, f"{DATASET_NAME}-{SPLIT}_rmeval_s{SCALE}_{len(rewardmodel_eval_samples)}.json")
-        with open(save_file.replace(".json", "_sample.json"), "w") as f:
-            json.dump(random.sample(rewardmodel_eval_samples,128), f, indent=2)
-        
-        with open(save_file, "w") as f:
-            json.dump(rewardmodel_eval_samples, f)
 
 if __name__ == '__main__':
     make_aitz_data()

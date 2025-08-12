@@ -11,9 +11,6 @@ from utils.data_utils.misc import is_pure_color, is_valid_string, decode_img_bas
 
 from collections import defaultdict
 
-# import easyocr
-# reader = easyocr.Reader(['ch_sim', 'en'], gpu = True)
-
 DATASET_NAME = 'GUICourse'
 
 random.seed(666)
@@ -22,9 +19,9 @@ SPLIT = ['train', 'test'][0]
 DEVICE_TYPE = ['web', 'smartphone'][1]
 
 DEBUG = False
-DATA_ROOT = "/mnt/jfs/copilot/lhx/ui_data/GUICourse"
+DATA_ROOT = "/mnt/vdb1/hongxin_li/GUICourse"
 
-SAVE_ROOT = f"/data/hongxin_li/scaling_exp/{DATASET_NAME}_processed"
+SAVE_ROOT = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data//scaling_exp/{DATASET_NAME}_processed"
 
 TEXTLOC = False
 OCR = False
@@ -161,10 +158,9 @@ if False:
                     # only for ascii strings
                     if is_valid_string(instruc):
                         tesseract_ocr_result = pytesseract.image_to_string(cv2.cvtColor(img[y1:y2,x1:x2], cv2.COLOR_BGR2GRAY)).strip()
-                        #easyocr_result = reader.readtext(cv2.cvtColor(img[y1:y2,x1:x2], cv2.COLOR_BGR2GRAY))
                     
                         tesseract_similarity_ratio = fuzz.ratio(tesseract_ocr_result.lower(), instruc.lower())
-                        #easyocr_similarity_ratio = fuzz.ratio(tesseract_ocr_result.lower(), instruc.lower())
+
                         if tesseract_similarity_ratio < 22:
                             invalid_elem[INCORRECT_TEXT_ANNO].add(sample_identifier)
                             continue
