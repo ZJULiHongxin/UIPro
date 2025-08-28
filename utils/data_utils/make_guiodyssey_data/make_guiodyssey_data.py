@@ -60,12 +60,11 @@ def make_guiodyssey_data():
         split_data = []
         for split in os.listdir(os.path.join(DATA_ROOT, 'splits')):
             split_data.append([split, set(json.load(open(os.path.join(DATA_ROOT, 'splits', split), 'r'))['train'])])
-        
 
             eps = split_data[0][1]
             for s in split_data[1:]:
                 eps = eps.intersection(s[1])
-        
+
         print(' | '.join(f"{split} inter rate: {len(eps) / len(split_samples):.2f}" for split, split_samples in split_data))
 
     # 如果取四个划分方法的训练集的交集，那么这个交集的样本展每个划分方法训练样本的比例为
@@ -81,16 +80,16 @@ def make_guiodyssey_data():
         #if ep_idx <= 50: continue
         with open(os.path.join(INSTRUC_DIR, ep_json_name), 'r') as f:
             ep_meta = json.load(f)
-        
+
         all_actions = [x['action'] for x in ep_meta['steps']]
 
         for step_idx, step in enumerate(ep_meta['steps']):
             action_type = step['action']
 
             last_action = ep_meta['steps'][step_idx-1]['action'] if step_idx > 0 else None
-            
+
             img_file = os.path.join(IMAGE_DIR, step["screenshot"])
-            
+
             if LONGEST != -1:
                 save_img_to = os.path.join(SAVE_IMAGE_DIR, step["screenshot"])
                 if not (RESUME and os.path.exists(save_img_to)):
