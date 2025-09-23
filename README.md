@@ -11,20 +11,27 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2406.08487">
+  <a href="https://arxiv.org/abs/2509.17328">
     <img src="https://img.shields.io/badge/📄_Paper-arXiv-B892FF?style=for-the-badge&logo=arxiv&logoColor=white&labelColor=1A1A2E" alt="Paper"/>
   </a>
-  <a href="https://huggingface.co/collections/yifanzhang114/slime-665bcb2d0d71762b86fdbd2d">
+  <!-- <a href="https://huggingface.co/collections/yifanzhang114/slime-665bcb2d0d71762b86fdbd2d">
     <img src="https://img.shields.io/badge/🤗_Models-Hugging_Face-FFB86C?style=for-the-badge&logo=huggingface&logoColor=white&labelColor=1A1A2E" alt="Models"/>
-  </a>
-  <a href="https://huggingface.co/datasets/yifanzhang114/SMR">
+  </a> -->
+  <!-- <a href="https://huggingface.co/datasets/yifanzhang114/SMR">
     <img src="https://img.shields.io/badge/📊_Dataset-Hugging_Face-6BCF7F?style=for-the-badge&logo=huggingface&logoColor=white&labelColor=1A1A2E" alt="Dataset"/>
-  </a>
+  </a> -->
 </p>
 
 <img src="assets/uipro_github_banner.png" alt="UIPro Project Banner" style="border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); margin: 20px 0;"/>
 
 </div>
+
+
+## 🔜 Future Updates
+
+- [ ] Upload UIPro models
+- [ ] Upload datasets
+- [√] June 28th, 2025. UIPro was accepted to ICCV 2026
 
 ---
 
