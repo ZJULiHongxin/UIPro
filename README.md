@@ -26,11 +26,11 @@
 
 </div>
 
+## 🔜 Future Updates (Repo under Construction)
 
-## 🔜 Future Updates
+- [ ] Upload UIPro models.
+- [ ] Upload datasets and data processing scripts along with systematic denoising procedures.
 
-- [ ] Upload UIPro models
-- [ ] Upload datasets
 - [√] June 28th, 2025. UIPro was accepted to ICCV 2026
 
 ---
@@ -48,25 +48,6 @@
 <table>
 <tr>
 <td width="50%" valign="top">
-
-#### 🧠 **Intelligent Understanding**
-- 📊 **20.6M** GUI understanding tasks
-- 🖼️ **2.5M** unique screenshots  
-- 🎯 **13** diverse task types
-- 🔄 Advanced denoising pipeline
-
-</td>
-<td width="50%" valign="top">
-
-#### ⚡ **Superior Performance**
-- 🏆 **State-of-the-art** on multiple benchmarks
-- 🚀 **68-85%** success rates across platforms
-- 🎮 **Unified action space** framework
-- 🌐 **Cross-platform** compatibility
-
-</td>
-</tr>
-</table>
 
 ---
 
@@ -90,31 +71,6 @@
 <tr>
 <td width="50%" align="center">
 
-#### 🎯 **Stage 1: GUI Understanding**
-```
-📚 Pre-training Phase
-├── 🧠 Element grounding
-├── 🔍 Function recognition  
-├── 🎯 Intent mapping
-└── 📊 Massive dataset learning
-```
-
-</td>
-<td width="50%" align="center">
-
-#### ⚡ **Stage 2: Agent Fine-tuning**
-```
-🎮 Action Execution Phase
-├── 📋 Task planning
-├── 🖱️ Precise interactions
-├── 🌐 Cross-platform ops
-└── 🎯 Unified action space
-```
-
-</td>
-</tr>
-</table>
-
 ---
 
 <div align="center">
@@ -128,11 +84,11 @@
 
 <br>
 
-| Capability | Description | Performance |
-|------------|-------------|-------------|
-| **🎯 Element Grounding** | Accurately locates UI elements based on descriptions | ⭐⭐⭐⭐⭐ |
-| **🔍 Functionality Recognition** | Understands purpose and function of interface components | ⭐⭐⭐⭐⭐ |
-| **🧭 Intent Mapping** | Connects user intentions to appropriate UI interactions | ⭐⭐⭐⭐⭐ |
+| Capability                             | Description                                              | Performance |
+| -------------------------------------- | -------------------------------------------------------- | ----------- |
+| **🎯 Element Grounding**         | Accurately locates UI elements based on descriptions     | ⭐⭐⭐⭐⭐  |
+| **🔍 Functionality Recognition** | Understands purpose and function of interface components | ⭐⭐⭐⭐⭐  |
+| **🧭 Intent Mapping**            | Connects user intentions to appropriate UI interactions  | ⭐⭐⭐⭐⭐  |
 
 </details>
 
@@ -141,11 +97,11 @@
 
 <br>
 
-| Capability | Description | Performance |
-|------------|-------------|-------------|
-| **📋 Task Planning** | Breaks down complex requests into actionable steps | ⭐⭐⭐⭐⭐ |
-| **⚡ Action Execution** | Performs clicks, typing, scrolling with high precision | ⭐⭐⭐⭐⭐ |
-| **🌐 Cross-Platform Navigation** | Seamless operation across different device types | ⭐⭐⭐⭐⭐ |
+| Capability                             | Description                                            | Performance |
+| -------------------------------------- | ------------------------------------------------------ | ----------- |
+| **📋 Task Planning**             | Breaks down complex requests into actionable steps     | ⭐⭐⭐⭐⭐  |
+| **⚡ Action Execution**          | Performs clicks, typing, scrolling with high precision | ⭐⭐⭐⭐⭐  |
+| **🌐 Cross-Platform Navigation** | Seamless operation across different device types       | ⭐⭐⭐⭐⭐  |
 
 </details>
 
@@ -159,18 +115,18 @@
 
 </div>
 
-### 🏆 **GUI Agent Task Evaluation**
+### 🏆 **GUI Agent Task Evaluation (Under Construction)**
 
 <div align="center">
 
-| 🎯 **Benchmark** | 🤖 **UIPro-SLiME (3B)** | 🚀 **UIPro-Qwen2VL (7B)** | 📊 **Metric** |
-|:---------------:|:----------------------:|:------------------------:|:------------:|
-| **AITW** | <span style="color: #00D4FF; font-weight: bold;">68.0%</span> | <span style="color: #FF6B6B; font-weight: bold;">70.4%</span> | Step SR |
-| **AndroidControl** | <span style="color: #00D4FF; font-weight: bold;">61.1%</span> | <span style="color: #FF6B6B; font-weight: bold;">85.5%</span> | Step SR |
-| **GUIAct-Web** | <span style="color: #00D4FF; font-weight: bold;">68.2%</span> | <span style="color: #FF6B6B; font-weight: bold;">69.1%</span> | Step SR |
-| **Mind2Web** | <span style="color: #00D4FF; font-weight: bold;">28.7%</span> | <span style="color: #FF6B6B; font-weight: bold;">48.4%</span> | Step SR |
+|  🎯**Benchmark**  |                🤖**UIPro-SLiME (3B)**                |               🚀**UIPro-Qwen2VL (7B)**               | 📊**Metric** |
+| :----------------------: | :--------------------------------------------------------: | :--------------------------------------------------------: | :----------------: |
+|      **AITW**      | `<span style="color: #00D4FF; font-weight: bold;">`68.0% | `<span style="color: #FF6B6B; font-weight: bold;">`70.4% |      Step SR      |
+| **AndroidControl** | `<span style="color: #00D4FF; font-weight: bold;">`61.1% | `<span style="color: #FF6B6B; font-weight: bold;">`85.5% |      Step SR      |
+|   **GUIAct-Web**   | `<span style="color: #00D4FF; font-weight: bold;">`68.2% | `<span style="color: #FF6B6B; font-weight: bold;">`69.1% |      Step SR      |
+|    **Mind2Web**    | `<span style="color: #00D4FF; font-weight: bold;">`28.7% | `<span style="color: #FF6B6B; font-weight: bold;">`48.4% |      Step SR      |
 
-<small><i>Step Success Rate (Step SR) - Higher is better</i></small>
+`<small><i>`Step Success Rate (Step SR) - Higher is better`</i></small>`
 
 </div>
 
@@ -192,12 +148,14 @@
 <br>
 
 #### 1️⃣ **Clone Repository**
+
 ```bash
 git clone https://github.com/ZJULiHongxin/UIPro.git
 cd UIPro
 ```
 
 #### 2️⃣ **Install Dependencies**
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -236,16 +194,16 @@ model = UIPro.from_pretrained("uipro-qwen2vl-7b")
 
 ### 📊 **Dataset Statistics**
 
-| Metric | Value | Description |
-|:------:|:-----:|:-----------:|
-| 📝 **Task Samples** | **20.6M** | GUI understanding tasks |
-| 🖼️ **Screenshots** | **2.5M** | Unique GUI screenshots |
-| 🎯 **Elements** | **3.3M** | Clean GUI elements |
-| 🔢 **Task Types** | **13** | Different task categories |
+|          Metric          |      Value      |        Description        |
+| :-----------------------: | :-------------: | :-----------------------: |
+| 📝**Task Samples** | **20.6M** |  GUI understanding tasks  |
+| 🖼️**Screenshots** | **2.5M** |  Unique GUI screenshots  |
+|   🎯**Elements**   | **3.3M** |    Clean GUI elements    |
+|  🔢**Task Types**  |  **13**  | Different task categories |
 
 </div>
 
-### 🏗️ **Data Compilation Pipeline**
+### 🏗️ **Data Compilation Pipeline (Under Construction; More data processing scripts will be released) **
 
 <details>
 <summary><b>🔧 General Setup Instructions</b></summary>
@@ -438,7 +396,6 @@ Finally, the processed training samples will be saved in `SAVE_DIR/GUIOdyssey_pr
 
 </details>
 
-
 <details>
 <summary><b>AMEX</b></summary>
 
@@ -473,7 +430,6 @@ Finally, the processed training samples will be saved in `SAVE_DIR/GUIOdyssey_pr
 </details>
 
 </details>
-
 
 <details>
 <summary><b>GUIAct</b></summary>
