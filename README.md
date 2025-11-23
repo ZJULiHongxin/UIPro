@@ -108,7 +108,31 @@ Our training dataset is the largest and most comprehensive GUI understanding col
 
 We also implemented a systematic denoising procedure to ensure data quality, removing up to 29% of noise from some data sources.
 
-### Data Compilation Pipeline
+### GUI Understanding Data Compilation Pipeline
+
+MobileViews
+
+Download the MobileViews raw data from ~[https://huggingface.co/datasets/mllmTeam/MobileViews](MobileViews HuggingFace Page) via `hf download mllmTeam/MobileViews  --repo-type dataset --local-dir ./MobileViews`. Then Unzip and place them in a folder like:
+
+root/
+├── MobileViews/
+│   ├── MobileViews_0-150000/
+│   └── MobileViews_0-150000.csv
+│   └── MobileViews_150001-291197/
+│   └── MobileViews_150001-291197.csv
+│   ├── MobileViews_0-150000/
+│   └── MobileViews_0-150000.csv
+│   └── MobileViews_150001-291197/
+│   └── MobileViews_150001-291197.csv
+
+Next, modify the `ROOT`, `SAVE_DIR`, `SPLIT`, `TEXTLOC`, `OCR`, `ELEMCLASS`, `INTENTGND`, `WIDGETLIST`, `SCALE` (The scale of coordinates), and `PROB_BOX` (The proportion of samples involving box prediction) in `utils/data_utils/make_mobileviews_data/91_extract_and_generate_mobilebiews_data.py` and then run it. Finally, the processed training samples will be saved in `SAVE_DIR/mobileviews_processed`. As the number of screenshots is large, this processing may take ~48 hours.
+
+After processing the samples, run `utils/data_utils/make_mobileviews_data/run_generate_symlinks.sh` to create a unified folder to which the millions of screenshots are moved.
+
+AndroidControl
+
+
+### Agent Data Compilation Pipeline
 
 First of all, create a root folder saving all raw data and a folder saving processed training samples.
 
@@ -134,6 +158,8 @@ Next, modify the `ROOT`, `SAVE_DIR`, `SPLIT`, `POINT_FORMAT` in `utils/data_util
 
 Android in the Zoo (AitZ)
 
+First download the raw data according to the instructions in ![https://github.com/google-research/google-research/blob/master/android_control/README.md][the AndroidControl Github Repo], and then unzip and place them in a folder like:
+
 First download the raw data according to the instructions in ![https://github.com/IMNearth/CoAT][the AitZ Github Repo], and then unzip and place them in a folder like:
 
 
@@ -151,7 +177,7 @@ root/
 │       └── install
 │       └── webshopping
 
-Next, modify the `ROOT`, `SAVE_DIR`, `SPLIT`, `POINT_FORMAT` in `utils/data_utils/make_aitw_data/make_aitw_data.py` and then run ```python utils/data_utils/make_aitw_data/make_aitw_data.py```. Finally, the processed training samples will be saved in `SAVE_DIR/AITW_processed`.
+Next, modify the `ROOT`, `SAVE_DIR`, `SCALE`, `SPLIT`, `USE_ACTION_REFEXP` in `utils/data_utils/make_aitz_data/make_aitz_data.py`. Finally, the processed training samples will be saved in `SAVE_DIR/AITZ_processed`.
 
 
 AndroidControl

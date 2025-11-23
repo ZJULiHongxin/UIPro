@@ -113,8 +113,8 @@ EMPTY_ELEM_TEXT = 'meaningless element' # not displayed text, content-descriptio
 OVERLY_LENGTHY_ELEM_TEXT = 'overly lengthy element text'
 INVALID_TEXT_LANGUAGE = 'invalid text language'
 DUPLICATE_ELEMEMNT = 'overlapping element'
-TOO_SMALL_ELEMENT = 'too small elemnent'
-OVERSIZED_ELEMENT = 'oversized elemnent'
+TOO_SMALL_ELEMENT = 'too small element'
+OVERSIZED_ELEMENT = 'oversized element'
 EXTREME_ASPECT_RATIO = 'extreme aspect ratio'
 GHOST_ELEMENT = 'ghost element'
 INCORRECT_TEXT_ANNO = 'incorrect text annotation'
@@ -275,6 +275,9 @@ def make_AndroidWorld_official_history_str(prev_actions: list[str], prev_outcome
         return ' '.join([f'Step ' + str(i + 1) + '- ' + f"Action selected: {action}, Outcome: {outcome}" for i, (action, outcome) in enumerate(zip(prev_actions, prev_outcomes), start=1)])
 
 def format_point_tag(loc: list[int | float], point_format):
+    if isinstance(loc, str):
+        loc = eval(loc)
+
     if point_format == 'qwen2':
         if len(loc) == 2:
             return f'{QWEN_BOX_START}({loc[0]},{loc[1]}),({loc[0]},{loc[1]}){QWEN_BOX_END}'

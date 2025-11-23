@@ -48,7 +48,7 @@ SPLIT: str = ['train', 'test'][0]
 INTENTGND: bool = False
 UICAPTION: bool = False
 
-USE_ACTION_REFEXP: bool = True # Set as True when generating Qwen2-format training samples
+USE_ACTION_REFEXP: bool = True # Set as True when inserting action referring expressions into the ground truth responses. For example, "Action: <|object_ref_start|>click on the "newegg" search result located at the top left<|object_ref_end|>\n{"action_type": "click", "target": (225,176)}"
 
 DEVICE_TAG: str = 'Android'
 

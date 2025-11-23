@@ -10,8 +10,8 @@ SCALE = 1000
 pattern = r'\(\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*\]'
 
 
-data = json.load(open("/data/hongxin_li/scaling_exp/WebUI_processed/WebUI_scale1000_267761_A_sample.json"))
-data_dir = ["/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/", "/mnt/shared-storage/groups/stepone_mm/lhx/ui_data/"][-1]
+data = json.load(open("/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/mobileviews_processed/mobileviews_TextLoc_OCR_IntentGnd_WidgetList_scale1000_6k_debug.json"))
+data_dir = ["/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/"][-1]
 
 if RANDOM: random.shuffle(data)
 
@@ -76,7 +76,7 @@ for idx, x in enumerate(data):
                     cv2.rectangle(img, (x1,y1), (x2,y2), color=color, thickness=2)
             elif any(task_type in x_id for task_type in ['intentgnd', 'textloc', 'funcpred_ground', 'icongnd', 'elemgnd']):
                 exp = user.split('.')[0].replace("<image>","").strip()
-                if 'with point' in user or 'center coord' in user:
+                if 'with point' in user or 'center coord' in user or gpt.count(',') == 1:
                     center_x, center_y = gpt[1:-1].split(',')
                     if SCALE != -1:
                         center_x, center_y = round(int(center_x)/SCALE*W), round(int(center_y)/SCALE*H)
@@ -95,6 +95,7 @@ for idx, x in enumerate(data):
             elif 'ocr' in x_id or 'iconref' in x_id:
                 exp = gpt
                 if user.find('(') == -1: continue
+
                 loc = user[user.find('(')+1:user.find(')')]
                 if 'with point' in user:
                     center_x, center_y = loc.split(',')

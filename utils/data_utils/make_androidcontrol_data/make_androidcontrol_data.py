@@ -343,10 +343,10 @@ for idx, d in tqdm(enumerate(dataset), total=15283, desc=f'fetching androidcontr
                     node_invalid_types['invalid box coordinates'] += 1; is_invalid = True
                     continue
                 if (x2 - x1) / W <= 0.005 or (y2 - y1) / H <= 0.005:
-                    node_invalid_types['too small elemnent'] += 1; is_invalid = True
+                    node_invalid_types['too small element'] += 1; is_invalid = True
                     continue
                 if (x2-x1) * (y2-y1) / (window_H*window_W) >= 0.65:
-                    node_invalid_types['oversize elemnent'] += 1; is_invalid = True
+                    node_invalid_types['oversize element'] += 1; is_invalid = True
                     continue
                 
                 if len(node_key_attr['node_desc']) == 0 and len(node_key_attr['resource_id']) == 0:
