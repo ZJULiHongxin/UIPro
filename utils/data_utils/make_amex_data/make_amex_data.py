@@ -32,7 +32,7 @@ DEBUG = False
 PLATFORM_INDEX = 1
 DATA_ROOT = [
     f"/mnt/vdb1/hongxin_li/{DATASET_NAME}",
-    f"/mnt/shared-storage/groups/stepone_mm/lhx/ui_data/{DATASET_NAME}"
+    f"/mnt/jfs/copilot/lhx/ui_data/{DATASET_NAME}"
 ][PLATFORM_INDEX]
 INSTRUC_DIR = os.path.join(DATA_ROOT, 'instruction_anno')
 ELEM_DIR = os.path.join(DATA_ROOT, 'element_anno')
