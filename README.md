@@ -30,7 +30,7 @@
 
 - **[2025-06-28]** 🎉 UIPro has been accepted to **ICCV 2025**!
 - **[2025-11-23]** Uploaded [UIPro models](https://huggingface.co/HongxinLi/UIPro_1stage).
-- **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, AndroidControl, GUIOdyssey, AMEX, GUIAct
+- **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
 - **[TODO]** Upload datasets
 
 ---
@@ -135,7 +135,7 @@ pip install -r requirements.txt
 
 </details>
 
-### 💡 **Basic Usage**
+<!-- ### 💡 **Basic Usage**
 
 <details>
 <summary><b>🎮 Quick Example</b></summary>
@@ -150,7 +150,7 @@ model = UIPro.from_pretrained("uipro-qwen2vl-7b")
 # Your GUI automation code here
 ```
 
-</details>
+</details> -->
 
 ---
 
@@ -199,13 +199,64 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │   ├── MobileViews_150001-291197.csv
    │   └── ...
    ```
-3. Modify `MOBILEVIEWS_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (box prediction probability) in `utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py`.
+3. Modify `MOBILEVIEWS_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py`.
 4. Run the processing script (this may take ~48 hours due to the large number of screenshots):
    ```bash
    python utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py
    ```
    Processed training samples will be saved in `ROOT/mobileviews_processed`.
 5. Finally, run `utils/data_utils/make_mobileviews_data/run_generate_symlinks.sh` to create a unified folder for screenshots.
+
+</details>
+
+<details>
+<summary><b>📱 WAE</b></summary>
+<br>
+
+1. Download the WAE raw data from [WAE DropBox](https://www.dropbox.com/scl/fo/im6hs48z43h86i80xr517/APE_cMh8qVX_l1Jf_kqArRA/ui30k?dl=0&rlkey=etueluh3jw5adnnntcgrqnqqq&subfolder_nav_tracking=1).
+
+2. Merge, unzip and organize the data as follows:
+   ```
+   root/
+   ├── WAE/
+   │   ├── COM.HSBFREE_25-output
+   │   ├── Com.sktelecom.minit_52-output
+   │   ├── Draziw.Button.Mines_71-output
+   │   ├── HBVerbrauchszaehler.lite_119-output
+   │   └── ...
+   ```
+
+3. Modify `WAE_DIR`, `ROOT_DIR`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_WAE_data/make_WAE_data.py`.
+
+4. Run the processing script (this may take ~24 hours due to the large number of screenshots):
+   ```
+   python utils/data_utils/make_WAE_data/make_WAE_data.py
+   ```
+   Processed training samples will be saved in `ROOT/WAE_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 WebUI</b></summary>
+<br>
+
+1. Download the WebUI raw data from [biglab/webui-all](https://huggingface.co/datasets/biglab/webui-all).
+
+2. Merge, unzip and organize the data as follows:
+   ```
+   root/
+   ├── WebUI/
+   │   ├── dh2 (GUI metadata resulting from unzipping)
+   │   ├── WebUI_screenshots (A folder used to save processed GUI screenshots)
+   ```
+
+3. Modify `WEBUI_DIR`, `WEBUI_PROCESSED_IMG_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_webui_data/make_webui_data.py`.
+
+4. Run the processing script (this may take ~24 hours due to the large number of screenshots):
+   ```
+   python utils/data_utils/make_webui_data/make_webui_data.py
+   ```
+   Processed training samples will be saved in `ROOT/WebUI_processed`.
 
 </details>
 
