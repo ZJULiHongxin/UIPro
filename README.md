@@ -30,8 +30,8 @@
 
 - **[2025-06-28]** 🎉 UIPro has been accepted to **ICCV 2025**!
 - **[2025-11-23]** Uploaded [UIPro models](https://huggingface.co/HongxinLi/UIPro_1stage).
-- **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
-- **[TODO]** Upload datasets
+- **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, MultiUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
+- **[TODO]** Upload whole datasets
 
 ---
 
