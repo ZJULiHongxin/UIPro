@@ -31,6 +31,7 @@
 - **[2025-06-28]** 🎉 UIPro has been accepted to **ICCV 2025**!
 - **[2025-11-23]** Uploaded [UIPro models](https://huggingface.co/HongxinLi/UIPro_1stage).
 - **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, MultiUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
+- **[2025-11-27]** Uploaded data processing scripts, and systematic denoising procedures for SeeClick-Web, RefExp
 - **[TODO]** Upload whole datasets
 
 ---
@@ -199,6 +200,7 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │   ├── MobileViews_150001-291197.csv
    │   └── ...
    ```
+   
 3. Modify `MOBILEVIEWS_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py`.
 4. Run the processing script (this may take ~48 hours due to the large number of screenshots):
    ```bash
@@ -257,6 +259,59 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    python utils/data_utils/make_webui_data/make_webui_data.py
    ```
    Processed training samples will be saved in `ROOT/WebUI_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 MultiUI</b></summary>
+<br>
+
+1. Download the MultiUI raw data from [neulab/MultiUI](https://huggingface.co/datasets/neulab/MultiUI).
+
+2. Merge, unzip and organize the data as follows:
+   ```
+   root/
+   ├── MultiUI/
+   │   ├── v0.6_5M
+   │   ├── v0.7_exclude_v0.6
+   |   ├── v0.8_exclude_v0.7
+   │   ├── stage1_data.json
+   │   ├── stage1_data_10k.json
+   |   ├── stage2_data_to_be_combined_with_general_data.json
+   ```
+
+3. Modify `MULTIUI_SAMPLE_FILE`, `IMG_DIR`, `SAVE_ROOT`, and `SCALE` (coordinate scale) in `utils/data_utils/make_multiui_data/make_multiui_data.py`.
+
+4. Run the processing script (this may take ~2 hours due to the large number of screenshots):
+   ```
+   python utils/data_utils/make_multiui_data/make_multiui_data.py
+   ```
+   Processed training samples will be saved in `ROOT/MultiUI_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 SeeClick-Web</b></summary>
+<br>
+
+1. Download the SeeClick-Web raw data from [SeeClick-Web Annotation File](https://box.nju.edu.cn/f/3b0f6ccb8bed476c8e39/) and [SeeClick-Web Images](https://box.nju.edu.cn/f/6a804cf190dd490a808f/).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   ├── SeeClick-Web/
+   │   ├── 0a5c8a5b7d73de574f2a21f27dbc9a53.png
+   │   ├── 0a6dcd3f9e1907af232e2c038a866f74.png
+   | ...
+   ```
+
+3. Modify `IMG_DIR`, `ANNO_FILE`, `SAVE_ROOT`, and `SCALE` (coordinate scale) in `utils/data_utils/make_seeclickweb_data/make_seeclickweb_data.py`.
+
+4. Run the processing script (this may take ~24 hours due to the large number of screenshots):
+   ```
+   python utils/data_utils/make_seeclickweb_data/make_seeclickweb_data.py
+   ```
+   Processed training samples will be saved in `ROOT/SeeClick-Web_processed`.
 
 </details>
 
