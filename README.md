@@ -32,6 +32,7 @@
 - **[2025-11-23]** Uploaded [UIPro models](https://huggingface.co/HongxinLi/UIPro_1stage).
 - **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, MultiUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
 - **[2025-11-27]** Uploaded data processing scripts, and systematic denoising procedures for SeeClick-Web, RefExp
+- **[2025-12-10]** Uploaded data processing scripts, and systematic denoising procedures for MOTIF, RefExp, and GUIEnv
 - **[TODO]** Upload whole datasets
 
 ---
@@ -182,6 +183,8 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 
 > **Note**: We also implemented a systematic denoising procedure to ensure data quality, removing up to 29% of noise from some data sources.
 
+#### GUI Understanding SFT Data Processing
+
 <details>
 <summary><b>📱 MobileViews</b></summary>
 <br>
@@ -314,6 +317,115 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    Processed training samples will be saved in `ROOT/SeeClick-Web_processed`.
 
 </details>
+
+<details>
+<summary><b>📱 GUIEnv</b></summary>
+<br>
+
+1. Download the GUIEnv raw data from [yiye2023/GUIEnv](https://huggingface.co/datasets/yiye2023/GUIEnv).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   │   └── GUICourse/
+   │            └── GUIEnv/
+   │                    ├── imgs
+   │                    ├── ocr_grounding_train_stage2_images.parquet
+   │                    ├── ocr_grounding_train_stage2_data.json
+   │                    ├── ocr_grounding_train_stage1_images.parquet
+   │                    ├── ocr_grounding_train_stage1_data.json
+   │                    ├── ocr_grounding_test_images.parquet
+   │                    └── ocr_grounding_test_data.json
+
+   ```
+
+3. Modify `SUBTASK`, `CURRENT_SPLIT`, `DATA_ROOT`, `SAVE_DIR`, `ENABLE_TEXTLOC`, `ENABLE_OCR`, `ENABLE_INTENT_GND`, and `SCALE` (coordinate scale) in `utils/data_utils/make_refexp_data/make_refexp_data.py`.
+
+4. Run the processing script:
+   ```
+   python utils/data_utils/make_refexp_data/make_refexp_data.py
+   ```
+   Processed training samples will be saved in `ROOT/RefExp_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 RefExp</b></summary>
+<br>
+
+1. Download the RICO image data from [SeeClick RICO Data](https://box.nju.edu.cn/f/7ae5e9bd4bf840d4add3/).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   │   └── rico/
+   │       ├── 72197.jpg
+   │       ├── ...
+   │       ├── 71949.json
+   │       └── ...
+
+   ```
+
+3. Modify `IMG_DIR`, `SAVE_ROOT`, , and `SCALE` (coordinate scale) in `utils/data_utils/make_refexp_data/make_refexp_data.py`.
+
+4. Run the processing script:
+   ```
+   python utils/data_utils/make_refexp_data/make_refexp_data.py
+   ```
+   Processed training samples will be saved in `ROOT/RefExp_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 MOTIF</b></summary>
+<br>
+
+1. Download the MOTIF image data from [HongxinLi/MOTIF](https://huggingface.co/datasets/HongxinLi/MOTIF).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   │   └── motif/
+
+   ```
+
+3. Modify `IMG_DIR`, `SAVE_ROOT_DIR`, and `SCALE` (coordinate scale) in `utils/data_utils/make_motif_data/make_motif_data.py`.
+
+4. Run the processing script:
+   ```
+   python utils/data_utils/make_motif_data/make_motif_data.py
+   ```
+   Processed training samples will be saved in `ROOT/MOTIF_processed`.
+
+</details>
+
+<details>
+<summary><b>📱 OmniAct</b></summary>
+<br>
+
+1. Download the OmniAct raw data from [Writer/omniact](https://huggingface.co/datasets/Writer/omniact).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   ├── OmniAct/
+   │   └── data/
+   │       ├── tasks/
+   │       ├── metadata/
+   │       └── data/
+   ```
+
+3. Modify `ROOT_DIR`, `SAVE_ROOT_DIR`, `SPLIT`, and `SCALE` (coordinate scale) in `utils/data_utils/make_omniact_data/make_omniact_data.py`.
+
+4. Run the processing script:
+   ```
+   python utils/data_utils/make_omniact_data/make_omniact_data.py
+   ```
+   Processed training samples will be saved in `ROOT/OmniAct_processed`.
+
+</details>
+
+#### Agentic SFT Data Processing
 
 <details>
 <summary><b>🤖 Android in the Wild (AiTW)</b></summary>

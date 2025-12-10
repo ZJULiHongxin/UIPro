@@ -732,7 +732,6 @@ from typing import List
 
 class VerbExtactor:
     def __init__(self):
-        super().__Init__()
         self.nlp = spacy.load("en_core_web_md")
 
     def find_first_verb(self, text):

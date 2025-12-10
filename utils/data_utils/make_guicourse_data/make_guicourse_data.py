@@ -51,7 +51,7 @@ class DatasetConfig:
     DATASET_NAME = 'GUICourse'
     
     # Subtask
-    SUBTASK = ['GUIAct'] # ['GUIEnv', 'GUIChat', 'GUIAct']
+    SUBTASK = ['GUIEnv'] # ['GUIEnv', 'GUIChat', 'GUIAct']
     
     # Random seed for reproducibility
     RANDOM_SEED = 666
@@ -65,13 +65,13 @@ class DatasetConfig:
     CURRENT_DEVICE_TYPE = DEVICE_TYPES[1]  # 'smartphone'
     
     # Path configurations
-    DATA_ROOT = "/mnt/jfs/copilot/lhx/ui_data/GUICourse"
-    SAVE_DIR = f"/data/hongxin_li/scaling_exp/{DATASET_NAME}_processed"
+    DATA_ROOT = "/mnt/vdb1/hongxin_li/GUICourse"
+    SAVE_DIR = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/{DATASET_NAME}_processed"
     
     # Processing flags
-    DEBUG_MODE = False
-    ENABLE_TEXTLOC = False
-    ENABLE_OCR = False
+    DEBUG_MODE = True
+    ENABLE_TEXTLOC = True
+    ENABLE_OCR = True
     ENABLE_INTENT_GND = False
     USE_ACTION_PROMPT = False
     SKIP_VALIDATION = False
@@ -81,7 +81,7 @@ class DatasetConfig:
     LOCATION_FORMAT = None  # e.g., 'action_json'
     
     # Coordinate scaling and box probability
-    COORDINATE_SCALE = 1000
+    SCALE = 1000
     BOUNDING_BOX_PROBABILITY = 0.0
     
     # Action configuration
@@ -132,10 +132,15 @@ def load_invalid_elements(filepath: str) -> Dict[str, set]:
     if os.path.exists(filepath):
         with open(filepath, 'r') as f:
             loaded_data = json.load(f)
-        return {k: set(v) for k, v in loaded_data.items()}
-    
-    # Initialize empty sets for each category
-    return {category: set() for category in INVALID_ELEMENT_CATEGORIES.values()}
+        temp = {k: set(v) for k, v in loaded_data.items()}
+
+        for v in INVALID_ELEMENT_CATEGORIES.values():
+            if v not in temp:
+                temp[v] = set()
+
+        return temp
+    else:
+        return {v: set() for v in INVALID_ELEMENT_CATEGORIES.values()}
 
 def save_invalid_elements(invalid_elements: Dict[str, set], filepath: str) -> None:
     """
@@ -187,13 +192,13 @@ def normalize_coordinates(box: List[float], image_size: Tuple[int, int],
     Args:
         box: Original bounding box coordinates [x1, y1, x2, y2]
         image_size: Image dimensions (width, height)
-        scale: Target scale (defaults to DatasetConfig.COORDINATE_SCALE)
+        scale: Target scale (defaults to DatasetConfig.SCALE)
         
     Returns:
         Normalized coordinates as list of integers
     """
     if scale is None:
-        scale = DatasetConfig.COORDINATE_SCALE
+        scale = DatasetConfig.SCALE
     
     width, height = image_size
     x1, y1, x2, y2 = box
@@ -258,7 +263,7 @@ class GUIEnvProcessor:
     
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.invalid_elements = {}
+        self.invalid_elements = {v: set() for v in INVALID_ELEMENT_CATEGORIES.values()}
         self.unique_elements = {}
         self.processed_samples = []
         self.statistics = {
@@ -347,7 +352,6 @@ class GUIEnvProcessor:
                            group_idx: int, total_groups: int) -> None:
         """Process all samples for a single image."""
         img_path = os.path.join(img_save_path, f"{img_id}.png")
-        img = None
         used_instructions = []
         
         if img_id not in self.unique_elements:
@@ -355,20 +359,18 @@ class GUIEnvProcessor:
         
         for sample in samples:
             processed_sample = self._process_single_sample(
-                sample, img_path, img, used_instructions
+                sample, img_path, used_instructions
             )
             
             if processed_sample is not None:
                 self.processed_samples.append(processed_sample)
-                if img is None:  # Load image only when needed
-                    img = cv2.imread(img_path)
         
         # Periodic saving of invalid elements record
-        if group_idx > 0 and (group_idx % 10000 == 0 or group_idx == total_groups - 1):
+        if group_idx > 0 and (group_idx % 5000 == 0 or group_idx == total_groups - 1):
             invalid_record_file = os.path.join(self.config.SAVE_DIR, 'invalid_elem_record.json')
             save_invalid_elements(self.invalid_elements, invalid_record_file)
     
-    def _process_single_sample(self, sample: Dict, img_path: str, img: Optional[np.ndarray],
+    def _process_single_sample(self, sample: Dict, img_path: str,
                              used_instructions: List[str]) -> Optional[Dict[str, Any]]:
         """Process a single sample from the dataset."""
         # Parse sample information
@@ -467,8 +469,8 @@ class GUIEnvProcessor:
         x1, y1, x2, y2 = box
         
         normalized_box = normalize_coordinates(box, (width, height))
-        center_x = round((x1 + x2) / 2 / width * self.config.COORDINATE_SCALE)
-        center_y = round((y1 + y2) / 2 / height * self.config.COORDINATE_SCALE)
+        center_x = round((x1 + x2) / 2 / width * self.config.SCALE)
+        center_y = round((y1 + y2) / 2 / height * self.config.SCALE)
         
         # Determine location format (box vs point)
         if (x1 != x2 and y1 != y2 and 
@@ -657,14 +659,14 @@ class GUIChatProcessor:
                 
                 # Normalize coordinates to target scale
                 normalized_box = [
-                    max(0, min(self.config.COORDINATE_SCALE - 1, 
-                              round(x1 / 1000 * self.config.COORDINATE_SCALE))),
-                    max(0, min(self.config.COORDINATE_SCALE - 1, 
-                              round(y1 / 1000 * self.config.COORDINATE_SCALE))),
-                    max(0, min(self.config.COORDINATE_SCALE - 1, 
-                              round(x2 / 1000 * self.config.COORDINATE_SCALE))),
-                    max(0, min(self.config.COORDINATE_SCALE - 1, 
-                              round(y2 / 1000 * self.config.COORDINATE_SCALE)))
+                    max(0, min(self.config.SCALE - 1, 
+                              round(x1 / 1000 * self.config.SCALE))),
+                    max(0, min(self.config.SCALE - 1, 
+                              round(y1 / 1000 * self.config.SCALE))),
+                    max(0, min(self.config.SCALE - 1, 
+                              round(x2 / 1000 * self.config.SCALE))),
+                    max(0, min(self.config.SCALE - 1, 
+                              round(y2 / 1000 * self.config.SCALE)))
                 ]
                 
                 # Convert to actual pixel coordinates for storage
@@ -943,7 +945,7 @@ class GUIActProcessor:
             direction = 'right' if horizontal_shift > 0 else 'left'
             distance = discretize_distance(abs(horizontal_shift))
         
-        start = list(map(lambda arg: round(arg * self.config.COORDINATE_SCALE), from_point))
+        start = list(map(lambda arg: round(arg * self.config.SCALE), from_point))
         
         task_attr['direction'] = direction
         action_str = SWIPE_TEMPLATE.format(start_x=start[0], start_y=start[1], direction=direction, distance=distance)
@@ -959,10 +961,10 @@ class GUIActProcessor:
         x1, y1, x2, y2 = coords
         task_attr['bbox'] = coords
         
-        center_x = round((x1 + x2) / 2 * self.config.COORDINATE_SCALE)
-        center_y = round((y1 + y2) / 2 * self.config.COORDINATE_SCALE)
+        center_x = round((x1 + x2) / 2 * self.config.SCALE)
+        center_y = round((y1 + y2) / 2 * self.config.SCALE)
         
-        if not (center_x < self.config.COORDINATE_SCALE and center_y < self.config.COORDINATE_SCALE):
+        if not (center_x < self.config.SCALE and center_y < self.config.SCALE):
             return None
         
         action_str = CLICK_TEMPLATE.format(target_x=center_x, target_y=center_y)
@@ -980,11 +982,11 @@ class GUIActProcessor:
         if sample.get('thoughts') and self.config.ENABLE_INTENT_GND:
             if random.random() <= self.config.BOUNDING_BOX_PROBABILITY:
                 with_box = True
-                x1, y1, x2, y2 = list(map(lambda arg: max(0, min(self.config.COORDINATE_SCALE-1, round(arg * self.config.COORDINATE_SCALE))), [x1, y1, x2, y2]))
+                x1, y1, x2, y2 = list(map(lambda arg: max(0, min(self.config.SCALE-1, round(arg * self.config.SCALE))), [x1, y1, x2, y2]))
                 target = f'({x1},{y1},{x2},{y2})'
             else:
-                center_x = max(0, min(self.config.COORDINATE_SCALE-1, round((x1+x2)/2 * self.config.COORDINATE_SCALE)))
-                center_y = max(0, min(self.config.COORDINATE_SCALE-1, round((y1+y2)/2 * self.config.COORDINATE_SCALE)))
+                center_x = max(0, min(self.config.SCALE-1, round((x1+x2)/2 * self.config.SCALE)))
+                center_y = max(0, min(self.config.SCALE-1, round((y1+y2)/2 * self.config.SCALE)))
                 target = f'({center_x},{center_y})'
                 with_box = False
             
@@ -997,7 +999,7 @@ class GUIActProcessor:
         """Process tap action."""
         center = list(map(float, action_info['point']['related'][7:-8].split(',')))
         task_attr['center'] = center
-        normalized_center = list(map(lambda x: max(0, min(self.config.COORDINATE_SCALE-1, round(x*self.config.COORDINATE_SCALE))), center))
+        normalized_center = list(map(lambda x: max(0, min(self.config.SCALE-1, round(x*self.config.SCALE))), center))
         
         action_str = CLICK_TEMPLATE.format(target_x=normalized_center[0], target_y=normalized_center[1])
         action_refexp = random.choice(ACTION_PREFIXES['click']['specific']) + ' a task-related element'
@@ -1023,8 +1025,8 @@ class GUIActProcessor:
             textfield_desc = ''
         else:
             textfield_box = list(map(int, action_info['element']['absolute'][5:-6].split(', ')))
-            textfield_center_x = max(0, min(self.config.COORDINATE_SCALE-1, round((textfield_box[0]+textfield_box[2])/2/width*self.config.COORDINATE_SCALE)))
-            textfield_center_y = max(0, min(self.config.COORDINATE_SCALE-1, round((textfield_box[1]+textfield_box[3])/2/height*self.config.COORDINATE_SCALE)))
+            textfield_center_x = max(0, min(self.config.SCALE-1, round((textfield_box[0]+textfield_box[2])/2/width*self.config.SCALE)))
+            textfield_center_y = max(0, min(self.config.SCALE-1, round((textfield_box[1]+textfield_box[3])/2/height*self.config.SCALE)))
             action_str = INPUT_TARGET_TEMPLATE.format(target_x=textfield_center_x, target_y=textfield_center_y, text=text)
             
             elem_path = sample['actions_label'][0]['element_path']
@@ -1047,9 +1049,9 @@ class GUIActProcessor:
         if self.config.CURRENT_SPLIT == 'train' and (relative_area >= 0.65 or relative_area <= 0.001):
             return None
         
-        normalized_center = [round((x1+x2)/2 * self.config.COORDINATE_SCALE), round((y1+y2)/2 * self.config.COORDINATE_SCALE)]
+        normalized_center = [round((x1+x2)/2 * self.config.SCALE), round((y1+y2)/2 * self.config.SCALE)]
         
-        if not (normalized_center[0] < self.config.COORDINATE_SCALE and normalized_center[1] < self.config.COORDINATE_SCALE):
+        if not (normalized_center[0] < self.config.SCALE and normalized_center[1] < self.config.SCALE):
             return None
         
         action_str = HOVER_TEMPLATE.format(target_x=normalized_center[0], target_y=normalized_center[1])
@@ -1100,11 +1102,11 @@ class GUIActProcessor:
         to_point = list(map(float, dual_points['to'][7:-8].split(',')))
         task_attr['from'], task_attr['to'] = from_point, to_point
         
-        norm_from_point = list(map(lambda arg: round(arg * self.config.COORDINATE_SCALE), from_point))
-        norm_to_point = list(map(lambda arg: round(arg * self.config.COORDINATE_SCALE), to_point))
+        norm_from_point = list(map(lambda arg: round(arg * self.config.SCALE), from_point))
+        norm_to_point = list(map(lambda arg: round(arg * self.config.SCALE), to_point))
         
-        if not (norm_from_point[0] < self.config.COORDINATE_SCALE and norm_from_point[1] < self.config.COORDINATE_SCALE and 
-                norm_to_point[0] < self.config.COORDINATE_SCALE and norm_to_point[1] < self.config.COORDINATE_SCALE):
+        if not (norm_from_point[0] < self.config.SCALE and norm_from_point[1] < self.config.SCALE and 
+                norm_to_point[0] < self.config.SCALE and norm_to_point[1] < self.config.SCALE):
             return None
         
         history = "Step 1. Find the textual content I should select."
@@ -1120,7 +1122,7 @@ class GUIActProcessor:
         """Process select action."""
         coords = list(map(float, action_info['element']['related'][5:-6].split(',')))
         x1, y1, x2, y2 = coords
-        normalized_center = [round((x1+x2)/2 * self.config.COORDINATE_SCALE), round((y1+y2)/2 * self.config.COORDINATE_SCALE)]
+        normalized_center = [round((x1+x2)/2 * self.config.SCALE), round((y1+y2)/2 * self.config.SCALE)]
         
         history = "Step 1. Navigate to the screen that displays the element I should select."
         action_str = SELECT_TEMPLATE.format(target_x=normalized_center[0], target_y=normalized_center[1], value=action_info['text'])
@@ -1268,7 +1270,7 @@ def save_dataset_results(samples: List[Dict[str, Any]], dataset_name: str,
         if config.USE_ACTION_REFEXP:
             filename_parts.append('wActRef')
     
-    filename_parts.extend([f's{config.COORDINATE_SCALE}', str(len(samples))])
+    filename_parts.extend([f's{config.SCALE}', str(len(samples))])
     filename = '-'.join(filename_parts) + '.json'
     
     save_path = os.path.join(config.SAVE_DIR, filename)
@@ -1300,7 +1302,7 @@ def main() -> None:
     print(f"  Device: {config.CURRENT_DEVICE_TYPE}")
     print(f"  Data Root: {config.DATA_ROOT}")
     print(f"  Save Directory: {config.SAVE_DIR}")
-    print(f"  Coordinate Scale: {config.COORDINATE_SCALE}")
+    print(f"  Coordinate Scale: {config.SCALE}")
     print("=" * 60)
     
     # Process GUIEnv dataset

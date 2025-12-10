@@ -572,7 +572,8 @@ def process_webqa_sample(sample: Dict[str, str], task_counters: Dict[str, int]) 
         processed_sample['id'] = f'autogui_multiui_embedqa_{task_counters["embed_qa"]}'
         task_counters['embed_qa'] += 1
         return processed_sample
-
+    else:
+        1+1
     # Sample doesn't match expected WebQA task types
     return None
 
@@ -807,6 +808,7 @@ def save_processed_data(
 
         # Save complete dataset
         with open(gnd_qa_filename, 'w', encoding='utf-8') as f:
+            print(f"Saving {len(grounding_qa_samples)} grounding/QA samples to {gnd_qa_filename}")
             json.dump(grounding_qa_samples, f)
 
     # Save UI caption samples (UI description generation tasks)
@@ -824,6 +826,7 @@ def save_processed_data(
 
         # Save complete dataset
         with open(caption_filename, 'w', encoding='utf-8') as f:
+            print(f"Saving {len(caption_samples)} UI caption samples to {caption_filename}")
             json.dump(caption_samples, f)
 
 
