@@ -7,11 +7,11 @@
 <p align="center">
   <img src="https://img.shields.io/badge/🔬_Research-ICCV_2025-FF6B6B?style=for-the-badge&labelColor=1A1A2E&color=FF6B6B" alt="Research Badge"/>
   <img src="https://img.shields.io/badge/🤖_AI-Multi--Modal-00D4FF?style=for-the-badge&labelColor=1A1A2E&color=00D4FF" alt="AI Badge"/>
-  <img src="https://img.shields.io/badge/⚡_Performance-SOTA-FFD93D?style=for-the-badge&labelColor=1A1A2E&color=FFD93D" alt="Performance Badge"/>
+  <!-- <img src="https://img.shields.io/badge/⚡_Performance-SOTA-FFD93D?style=for-the-badge&labelColor=1A1A2E&color=FFD93D" alt="Performance Badge"/> -->
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2509.17328">
+  <a href="https://openaccess.thecvf.com/content/ICCV2025/html/Li_UIPro_Unleashing_Superior_Interaction_Capability_For_GUI_Agents_ICCV_2025_paper.html">
     <img src="https://img.shields.io/badge/📄_Paper-arXiv-B892FF?style=for-the-badge&logo=arxiv&logoColor=white&labelColor=1A1A2E" alt="Paper"/>
   </a>
   <!-- <a href="https://huggingface.co/collections/yifanzhang114/slime-665bcb2d0d71762b86fdbd2d">
