@@ -88,11 +88,11 @@ def action2step(step_data):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretrained', type=str, default='/mnt/vdb1/hongxin_li/uipro_ckpt/0511_Qwen2VL-2B_ShowUI-Gnd1489k+Mind2Web_s1000_7p7k/lora/checkpoint-540')
-    parser.add_argument('--debug', type=bool, default=False)
+    parser.add_argument('--pretrained', type=str, default='/mnt/vdb1/hongxin_li/uipro_ckpt/0123_UIPro_Qwen2-VL-7B_gnd2planning4336k+Mind2Web-GUIAct_wActRef_s1000_108k/lora/checkpoint-3368')
+    parser.add_argument('--debug', type=bool, default=True)
     parser.add_argument('--cot', type=bool, default=False)
     parser.add_argument('--scale', type=int, default=1000)
-    parser.add_argument('--action_refexp', type=bool, default=False)
+    parser.add_argument('--action_refexp', type=bool, default=True)
     parser.add_argument('--task', type=str, default='website', choices=['website', 'task', 'domain'])
     parser.add_argument('--device_tag', type=str, default='Web')
     parser.add_argument('--max_prev_acts', type=int, default=66)
@@ -133,7 +133,7 @@ if __name__ == '__main__':
     if "num_beams" not in gen_kwargs:
         gen_kwargs["num_beams"] = 1
 
-    index=-1
+    index=0
 
     ROOT = [
         "/mnt/nvme0n1p1/hongxin_li/UI_training_data/Mind2Web",
@@ -143,11 +143,16 @@ if __name__ == '__main__':
 
     mind2web_imgs_dir = os.path.join(ROOT, "mind2web_images")
 
+    # 1341 tasks (9378 steps) in total
+    # website: 177 tasks (1373 steps) in total
+    # domain: 912 tasks (5911 steps) in total
+    # task: 252 tasks (2094 steps) in total
     mind2web_test = json.load(open(f'{ROOT}/mind2web_data_test_' + args.task + '.json', 'r'))
 
+    time_record = [0, 0]
     results = []
     for ep_idx, episode in tqdm(enumerate(mind2web_test), total=len(mind2web_test), desc=f'Evaluating {postfix} on Mind2Web {args.task} (Max prev acts: {args.max_prev_acts})'):
-        if args.debug and ep_idx > 5:
+        if args.debug and ep_idx > 4:
             break
 
         goal = episode["confirmed_task"]
@@ -244,6 +249,9 @@ if __name__ == '__main__':
                         response = tokenizer.batch_decode(cont, skip_special_tokens=True)[0]
                 else:
                     response = model.get_model_response(prompt, f"file://{img_path}", max_new_tokens=4096, sys_prompt=OSATLAS_MIND2WEB_PROMPT if 'atlas' in postfix.lower() else '')
+                
+                time_record[0] += time.time() - t1
+                time_record[1] += 1
             except Exception as e:
                 print(e)
                 continue
@@ -356,12 +364,13 @@ if __name__ == '__main__':
     print("Episode Success: " + str(num_episode_success / num_episode))
     print("Operation F1 cate: " + str([np.mean(x) for x in op_f1.values()]))
 
-    macro_ele_acc = np.mean([np.mean(x) for x in macro_ele_acc.values()]).item()
     macro_step_acc = np.mean([np.mean(x) for x in macro_step_acc.values()]).item()
     macro_action_f1 = np.mean([np.mean(x) for x in macro_action_f1.values()]).item()
+    avg_inference_time = time_record[0] / time_record[1] if time_record[1] > 0 else 0
     print("Macro Ele Acc: " + str(macro_ele_acc))
     print("Macro Op F1: " + str(macro_action_f1))
     print("Macro Step SR: " + str(macro_step_acc))
+    print("Avg Inference Time: " + str(avg_inference_time))
 
     print(f"{macro_ele_acc*100:2f} | {macro_action_f1*100:.2f} | {macro_step_acc*100:.2f}")
 
@@ -380,7 +389,8 @@ if __name__ == '__main__':
                     "Operation F1 cate": str([np.mean(x).item() for x in op_f1.values()]),
                     "Macro Ele Acc": macro_ele_acc,
                     "Macro Op F1": macro_action_f1,
-                    "Macro Step SR": macro_step_acc
+                    "Macro Step SR": macro_step_acc,
+                    "time_per_step": avg_inference_time
                 },
                 "log": results
             },

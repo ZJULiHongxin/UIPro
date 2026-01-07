@@ -29,17 +29,17 @@ from colorama import Fore, Style
 
 def clean_answer(text):
     text = text.lower().strip(' .?!').replace('"', '').replace("'", '').replace(',', '').replace(";", '')
-    
+
     return text
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B', 'Qwen/Qwen2-VL-7B-Instruct'][0])
-    parser.add_argument('--debug', type=bool, default=False)
+    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B'][-1])
+    parser.add_argument('--debug', type=bool, default=True)
     parser.add_argument('--cot', type=bool, default=False)
     parser.add_argument('--scale', type=int, default=1)
-    parser.add_argument('--action_refexp', type=bool, default=False)
-    parser.add_argument('--device_type', type=str, default='Mobile', choices=['Web', 'Mobile'])
+    parser.add_argument('--action_refexp', type=bool, default=True)
+    parser.add_argument('--device_type', type=str, default='Web', choices=['Web', 'Mobile'])
     parser.add_argument('--max_prev_acts', type=int, default=6)
     parser.add_argument('--original_actspace', type=bool, default=False)
 
@@ -115,7 +115,7 @@ if __name__ == '__main__':
     # 'input_text'
     # 'click'
 
-    # Web
+    # Web: 1107 tasks (2346 steps) in totals
     # "click": 1461,
     # "scroll": 560,
     # "status": 197,
@@ -130,6 +130,7 @@ if __name__ == '__main__':
     if args.debug:
         guiact_test = random.sample(guiact_test, 15)
 
+    time_record = [0, 0]
     for step_idx, step in tqdm(enumerate(guiact_test), total=len(guiact_test), desc=f"{postfix} on {args.device_type}"):
         goal = step["task"]
         
@@ -229,6 +230,8 @@ if __name__ == '__main__':
                 step_result['prompt'] = prompt
                 response = model.get_model_response(prompt, f"file://{img_path}", max_new_tokens=4096, sys_prompt=OSATLAS_MIND2WEB_PROMPT if 'atlas' in postfix.lower() else '')
 
+            time_record[0] += time.time() - t1
+            time_record[1] += 1
 
             step_result["response"] = response
 
@@ -378,9 +381,13 @@ if __name__ == '__main__':
         if metric_name == 'num_wrong_format': continue
         acc_cnt, cnt = aggr_metrics[metric_name][1], aggr_metrics[metric_name][2]
         aggr_metrics[metric_name][0] = acc_cnt / cnt if cnt > 0 else 0
+    
+    avg_inference_time = time_record[0] / time_record[1] if time_record[1] > 0 else 0
+    aggr_metrics['time_per_step'] = avg_inference_time
         
     print("\nFinal:")
     pprint(aggr_metrics)
+    print("Average inference time per step: " + str(avg_inference_time))
 
     os.makedirs(save_to, exist_ok=True)
     save_file = os.path.join(save_to, args.device_type + '-' + datetime.now().strftime("%m-%d-%H-%M-%S")) + ('_debug' if args.debug else '') + '.json'

@@ -68,7 +68,7 @@ if __name__ == '__main__':
     random.seed(0)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B', '/mnt/vdb1/hongxin_li/uipro_ckpt/0122_UIPro_Qwen2-VL-7B_gnd2planning4336k+AITW-AITZ-AMEX-AndCon_wActRef_s1000_219k/lora/checkpoint-1416/'][-1])
+    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B', '/mnt/vdb1/hongxin_li/uipro_ckpt/0122_UIPro_Qwen2-VL-7B_gnd2planning4336k+AITW-AITZ-AMEX-AndCon_wActRef_s1000_219k/lora/checkpoint-1416/','Qwen/Qwen2-VL-7B-Instruct', 'HongxinLi/UIPro_2stage_Mobile'][-1])
     parser.add_argument('--imgs_dir', type=str, default=[
         '/data0/jingran/workspace/UI_training_data/AITW/aitw_images/',
         '/mnt/vdb1/hongxin_li/AITW/aitw_images/',
@@ -106,6 +106,9 @@ if __name__ == '__main__':
         model = SHOWUI(device='cuda', model_name=model_path)
         args.scale = 1
         MAX_PREV_ACT = 6
+    else:
+        model = QWen2VL(device='cuda', model_name=model_path)
+        MAX_PREV_ACT = 6
 
     gen_kwargs = {}      
 
@@ -121,7 +124,7 @@ if __name__ == '__main__':
 
     aitw_imgs_dir = args.imgs_dir
 
-    aitw_test = datasets.load_dataset(f"HongxinLi/AITW_test", split='test')
+    aitw_test = datasets.load_dataset(f"HongxinLi/AITW_test", split='test') # 578 tasks (4663 steps) in totals
 
     # aitw_test = json.load(open(os.path.join(os.path.dirname(aitw_imgs_dir),'aitw_data_test.json'), 'r'))
     aitw_test_each_app = {}
@@ -370,8 +373,11 @@ if __name__ == '__main__':
         print(f"dual_click_acc: {dual_click_acc}")
         print(f"Num wrong format: {num_wrong_format}")
 
+    avg_inference_time = time_record[0] / time_record[1] if time_record[1] > 0 else 0
+    tasks_result['time_per_step'] = avg_inference_time
     tasks_result['avg'] = score_average / 5
     print("Average score: " + str(score_average / 5))
+    print("Average inference time per step: " + str(avg_inference_time))
 
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     eval_result_dir = os.path.join(os.path.dirname(__file__), 'eval_results/AITW', f"{postfix}{'_CoT' if args.cot else ''}{'_wActRef' if args.action_refexp else ''}")

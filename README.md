@@ -563,7 +563,7 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 <summary><b>🎭 GUIAct</b></summary>
 <br>
 
-1. Download raw data from the [GUIAct HF Repo](https://huggingface.co/datasets/yiye2023/GUIAct).
+1. Download raw data from the [GUIAct HF Repo](https://huggingface.co/datasets/yiye2023/GUIAct) by running `hf download yiye2023/GUIAct --repo-type dataset --local-dir path/to/GUICourse/GUIAct`.
 2. Organize the data:
    ```
    root/
