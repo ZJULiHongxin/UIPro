@@ -21,16 +21,15 @@ from PIL import Image
 
 # Local imports
 from eval_utils import mind2web_action2step
-from utils.data_utils.misc import keep_unique_actions, remove_redundant_spaces
+from utils.data_utils.misc import keep_unique_actions, remove_redundant_spaces, qwen2vl_to_nornal_action
 from utils.data_utils.task_prompt_lib import (
-    ATLAS_PROMPT, make_actionplanning_prompt, OSATLAS_MIND2WEB_PROMPT
+    ATLAS_PROMPT, make_actionplanning_prompt, OSATLAS_MIND2WEB_PROMPT, make_planning_protocol
 )
 from uipro import constants
 from uipro.model.builder import load_pretrained_model
 from uipro.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from uipro.conversation import conv_templates
 from utils.openai_utils.qwen2vl import QWen2VL
-from utils.openai_utils.misc import extract_thought_components
 import transformers.data.metrics.squad_metrics as squad_metrics
 
 # Configure logging
@@ -106,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate model on Mind2Web dataset.")
     parser.add_argument('--pretrained', type=str,
                         default=['/mnt/vdb1/hongxin_li/uipro_ckpt/0123_UIPro_Qwen2-VL-7B_gnd2planning4336k+Mind2Web-GUIAct_wActRef_s1000_108k/lora/checkpoint-3368',
-                                 'HongxinLi/UIPro-7B_Stage2_Web'][-1],
+                                 'HongxinLi/UIPro-7B_Stage2_Web', 'Qwen/Qwen2-VL-7B-Instruct', 'HongxinLi/UIPro-7B_Stage2_Web'][-2],
                         help="Path or name of the pretrained model.")
     parser.add_argument('--debug', action='store_true', help="Enable debug mode (limited episodes).")
     parser.add_argument('--cot', action='store_true', help="Whether to use Chain-of-Thought prompting.")
@@ -283,15 +282,23 @@ def parse_predicted_action(response: str, postfix: str) -> Dict[str, Any]:
         return parse_atlas_action(response)
     else:
         # Standard format: "Action: { ... }"
+        
         if 'Action:' in response:
             action_str = response.split('Action:')[1].strip().split('\n')[-1]
+        elif 'Qwen2-VL' in postfix:
+            action_str = response[response.rfind('{"action'): response.rfind('}')+1]
+            action_str = qwen2vl_to_nornal_action(action_str.replace('}}','}'))
         else:
             action_str = response.strip().split('\n')[-1]
 
         try:
             return ast.literal_eval(action_str)
         except (ValueError, SyntaxError):
-            raise ValueError(f"Failed to parse action string: {action_str}")
+            action_str += '}'  # Add missing closing brace
+            try:
+                return ast.literal_eval(action_str)
+            except:
+                raise ValueError(f"Failed to parse action string: {action_str}")
 
 
 def evaluate_step(step_data: Dict[str, Any], action_step_ref: Dict[str, Any],
@@ -473,6 +480,16 @@ def evaluate_episode(episode: Dict[str, Any], model: Any, args: argparse.Namespa
         # Build prompt
         if 'atlas' in postfix.lower():
             prompt = ATLAS_PROMPT.format(global_task=goal, history='None')
+        elif 'Qwen2-VL' in postfix:
+            prompt = make_planning_protocol(
+                bmk_name='Mind2Web',
+                task=goal,
+                history=history_str,
+                protocol_type='no',
+                use_guidelines=False,
+                use_qwen_actspace=True,
+                use_obs=False, use_progress=False, use_index=False, use_outcome=False
+            )
         else:
             prompt = make_actionplanning_prompt(
                 goal, history_str, device_tag=args.device_tag,

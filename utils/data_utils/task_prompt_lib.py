@@ -1023,8 +1023,9 @@ ACT_SPACE = {
     'all': ['status_successful', 'click_xy1000', 'long-press_xy', 'swipe', 'input-text', 'press_enter', 'navigate_back', 'navigate_home', 'wait', 'open_app'],
     
     'unified_mobile': ['status_successful', 'click_xy1000', 'long-press_xy', 'swipe', 'input-text', 'press_enter', 'navigate_back', 'navigate_home', 'wait', 'open_app'],
-    
+
     'AITW': ['status_successful', 'click_xy1000', 'swipe', 'input-text', 'press_enter', 'navigate_back', 'navigate_home'],
+    'Mind2Web': ['click_xy1000', 'input-text', ],
     'AndroidControl': ['click_xy1000', 'swipe', 'input-text',  'navigate_back', 'wait', 'open_app'],
     'AndroidWorld': ['answer', 'status_successful', 'status_infeasible', 'click_xy1000', 'long-press_xy', 'swipe_xy', 'input-text_xy', 'open_app', 'navigate_back', 'navigate_home', 'press_enter', 'wait'],
     'AndroidControl_reflec': ['click_xy1000', 'swipe_xy', 'input-text',  'navigate_back', 'wait', 'open_app'],

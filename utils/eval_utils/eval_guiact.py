@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments for GUIAct evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate model on GUIAct dataset.")
     parser.add_argument('--pretrained', type=str,
-                        default=['showlab/ShowUI-2B', 'Qwen/Qwen2-VL-7B-Instruct', 'HongxinLi/UIPro_2stage_Mobile'][-1],
+                        default=['showlab/ShowUI-2B', 'Qwen/Qwen2-VL-7B-Instruct', 'HongxinLi/UIPro-7B_Stage2_Web'][-1],
                         help="Path or name of the pretrained model.")
     parser.add_argument('--debug', action='store_true', help="Enable debug mode (limited steps).")
     parser.add_argument('--cot', action='store_true', help="Whether to use Chain-of-Thought prompting.")
