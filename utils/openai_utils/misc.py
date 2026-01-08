@@ -2,6 +2,7 @@ import re
 import json
 
 def extract_thought_components(response):
+    obs = thought = funcdesc = action_pred_raw = summary = None
     response = response.replace("```json", "").replace("```", "").strip()
 
     # HTML-tag format
@@ -22,6 +23,8 @@ def extract_thought_components(response):
         else: summary = ''
 
         return obs, thought, funcdesc, action_pred_raw, summary
+    elif response.startswith('{"action'):
+        return obs, thought, funcdesc, response, summary
     elif response.startswith('{'):
         try:
             dict_action = eval(response)
