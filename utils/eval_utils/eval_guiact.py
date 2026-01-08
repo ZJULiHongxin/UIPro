@@ -23,7 +23,7 @@ from utils.openai_utils.qwen2vl import QWen2VL
 from utils.openai_utils.osatlas import OSATLAS
 from utils.openai_utils.showui import SHOWUI, to_showui_action, showui_to_original_action
 import transformers.data.metrics.squad_metrics as squad_metrics
-from utils.data_utils.misc import keep_unique_actions, restore_unified_actions
+from utils.data_utils.misc import keep_unique_actions, restore_unified_actions, qwen2vl_to_nornal_action
 from utils.openai_utils.misc import extract_thought_components
 from colorama import Fore, Style
 
@@ -34,7 +34,7 @@ def clean_answer(text):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B'][-1])
+    parser.add_argument('--pretrained', type=str, default=['showlab/ShowUI-2B','Qwen/Qwen2-VL-7B-Instruct'][-1])
     parser.add_argument('--debug', type=bool, default=True)
     parser.add_argument('--cot', type=bool, default=False)
     parser.add_argument('--scale', type=int, default=1)

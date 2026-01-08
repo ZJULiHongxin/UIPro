@@ -33,7 +33,7 @@ class QWen2VL:
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16, 
-                attn_implementation="flash_attention_2",
+                attn_implementation="eager"#"flash_attention_2",
             )
      
         self.model.to(device)
