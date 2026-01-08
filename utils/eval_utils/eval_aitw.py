@@ -31,7 +31,7 @@ from uipro.mm_utils import tokenizer_image_token, process_images, get_model_name
 from uipro.conversation import conv_templates
 from utils.openai_utils.qwen2vl import QWen2VL
 from utils.openai_utils.showui import SHOWUI, to_showui_action, showui_to_original_action
-from utils.data_utils.misc import keep_unique_actions
+from utils.data_utils.misc import keep_unique_actions, qwen2vl_to_nornal_action
 
 # Configure logging
 logging.basicConfig(
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Evaluate model on AITW dataset.")
     parser.add_argument('--pretrained', type=str, 
-                        default='HongxinLi/UIPro_2stage_Mobile',
+                        default=['HongxinLi/UIPro_2stage_Mobile','Qwen/Qwen2-VL-7B-Instruct'][0],
                         help="Path or name of the pretrained model.")
     parser.add_argument('--imgs_dir', type=str, 
                         default='/mnt/vdb1/hongxin_li/AITW/aitw_images/',
@@ -228,6 +228,10 @@ def parse_predicted_action(response: str, postfix: str, scale: int) -> Dict:
         # Standard format: "Action: { ... }"
         if 'Action:' in response:
             action_str = response.split('Action:')[1].strip().split('\n')[-1]
+        elif '{"action' in response:
+            action_str = response[response.rfind('{"action'): response.rfind('}')+1]
+            if 'Qwen2-VL' in postfix:
+                action_str = qwen2vl_to_nornal_action(action_str.replace('}}','}'))
         else:
             action_str = response.strip().split('\n')[-1]
             
@@ -247,7 +251,7 @@ def evaluate_task(task_name: str, steps: List[Dict], model: Any, args: argparse.
                   aitw_imgs_dir: str) -> Tuple[Dict, List[Dict], float]:
     """Evaluate all steps in a single task."""
     logger.info(f"Starting evaluation for task: {task_name}")
-    
+
     task_logs = []
     stats = {
         'corr_action': 0, 'corr_type': 0, 'num_text': 0, 'corr_text': 0,
@@ -255,6 +259,8 @@ def evaluate_task(task_name: str, steps: List[Dict], model: Any, args: argparse.
         'num_both_click': 0, 'corr_both_click': 0, 'num_wrong_format': 0, 'num': 0
     }
     
+    # AITW tests these action types: {'press_key', 'click', 'navigate_back', 'input_text', 'status', 'swipe', 'navigate_home'}
+
     total_time = 0
     
     pbar = tqdm(enumerate(steps), total=len(steps), 
@@ -263,7 +269,9 @@ def evaluate_task(task_name: str, steps: List[Dict], model: Any, args: argparse.
     for step_i, step_data in pbar:
         if args.debug and step_i >= 6:
             break
-            
+        # Action debug
+        # if step_data['action_type'] not in ['swipe']:continue
+
         img_filename = step_data["image"]
         step_idx = int(img_filename.split('_')[-1][:-4])
         img_path = os.path.join(aitw_imgs_dir, img_filename)
@@ -283,6 +291,16 @@ def evaluate_task(task_name: str, steps: List[Dict], model: Any, args: argparse.
             prompt = ATLAS_PROMPT.format(global_task=goal, history=history_str)
         elif 'showui' in postfix.lower() and 'qwen' not in postfix.lower():
             prompt = goal
+        elif 'Qwen2-VL' in postfix:
+            prompt = make_planning_protocol(
+                bmk_name='AITW',
+                task=goal,
+                history=history_str,
+                protocol_type='no',
+                use_guidelines=False,
+                use_qwen_actspace=True,
+                use_obs=False, use_progress=False, use_index=False, use_outcome=False
+            )
         else:
             prompt = make_actionplanning_prompt(
                 goal, history_str, device_tag=args.device_tag, 
@@ -463,7 +481,7 @@ def main():
     avg_time = total_inference_time / total_steps if total_steps > 0 else 0
     
     all_results['avg_score'] = f"{100 * avg_score:.2f}%"
-    all_results['avg_inference_time_per_step'] = f"{avg_time:.4f}s"
+    all_results['time_per_step'] = f"{avg_time:.4f}s"
     
     logger.info(f"Evaluation finished. Average Score: {all_results['avg_score']}")
     

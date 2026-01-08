@@ -1525,6 +1525,76 @@ def restore_unified_actions(action: dict, only_scroll: bool = False) -> dict:
     return action
 
 
+def qwen2vl_to_nornal_action(action_json, use_assert: bool = False):
+    """Convert JSONAction to QwenAction"""
+    if isinstance(action_json, str):
+        action_json = json.loads(action_json)
+
+    action_type = action_json['action']
+    if action_type == 'click':
+        target = action_json.get('target', action_json.get('coordinate'))
+        if target is None:
+            if 'x' in action_json:
+                target = [round(action_json['x']), round(action_json['y'])]
+
+        act = CLICK_TEMPLATE.format(target_x=target[0], target_y=target[1]) # '{{"action": "click", "coordinate": [{target_x}, {target_y}]}}'
+    elif action_type == 'long_press':
+        target = action_json.get('target', action_json.get('coordinate'))
+        if target is None:
+            if 'x' in action_json:
+                target = [round(action_json['x']), round(action_json['y'])]
+        act = LONG_PRESS_TEMPLATE.format(target_x=target[0], target_y=target[1], duration=action_json.get('duration', 1))
+    elif action_type in ['swipe', 'scroll']:
+        start_x, start_y = action_json['coordinate']
+        end_x, end_y = action_json['coordinate2']
+        direction = get_swipe_direction(start=[start_x, start_y], end=[end_x, end_y], is_swipe=True)
+
+        act = SWIPE_TEMPLATE.format(start_x=start_x, start_y=start_y, direction=direction, distance='medium')
+    elif action_type == 'type':
+        txt = action_json['text']
+        if txt.count('"') % 2 == 1:
+            txt = txt.replace('"', '')
+        act = INPUT_TEMPLATE.format(text=txt)
+    elif action_type == 'system_button':
+        button = action_json['button'].lower()
+        if 'back' in button:
+            act = NAVIGATE_BACK_TEMPLATE # '{{"action": "system_button", "button": "{button}"}}'
+        elif 'home' in button:
+            act = NAVIGATE_HOME_TEMPLATE
+        elif 'enter' in button:
+            act = ENTER_TEMPLATE
+        elif 'menu' in button:
+            act = NAVIGATE_RECENT_TEMPLATE
+    elif action_type in ['navigate_back', 'back']:
+        act = NAVIGATE_BACK_TEMPLATE
+    elif action_type in ['navigate_home', 'home']:
+        act = NAVIGATE_HOME_TEMPLATE
+    elif action_type == 'press_key':
+        act = PRESSKEY_TEMPLATE.format(key=action_json['key'])
+    elif action_type in ['press_enter', 'enter']:
+        act = ENTER_TEMPLATE
+    elif action_type == 'open_app':
+        act = OPEN_APP_TEMPLATE.format(app_name=action_json.get('app_name', action_json.get('text')))
+    elif action_type == 'terminate':
+        if any(k in action_json['status'] for k in ['unsuccessful', 'failure', 'failed', 'infeasible', 'incomplete']):
+            action_json['status'] = 'failed'
+        elif any(k in action_json['status'] for k in ['successful', 'success', 'feasible', 'complete']):
+            action_json['status'] = 'successful'
+        else:
+            if use_assert: 
+                assert False, f"Invalid goal status: {action_json['status']}"
+            else:
+                return None, None
+        act = STATUS_TEMPLATE.format(goal_status='success' if action_json['status'] == 'successful' else 'failure', answer='') # {"action": "terminate", "status": <"success" or "failure">}
+    elif action_type == 'answer':
+        ans = action_json.get('answer', action_json.get('text'))
+        act = ANSWER_TEMPLATE.format(text=ans)
+    elif action_type == 'wait':
+        act = WAIT_TEMPLATE
+    else:
+        raise ValueError(f"Unsupported action type: {action_type}")
+    return act
+
 def to_qwen_action(action_json, W, H, type_w_coords: bool = True, scale: int = -1, use_assert: bool = True):
     """Convert JSONAction to QwenAction"""
     action_type = action_json.get('action_type', 'action')

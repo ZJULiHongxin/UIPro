@@ -410,7 +410,7 @@ def pred_2_format(step_data, scale=1):
     elif action_type == 'press_key' and step_data['key'].lower() == 'enter':
         action_type_new = 7
     elif action_type == 'status':
-        if step_data['goal_status'] == 'successful':
+        if step_data['goal_status'] in ['successful', 'success', 'feasible']:
             action_type_new = 10
         else: action_type_new = 11
     elif action_type == 'status_complete':
