@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--scale', type=int, default=1000, help="Coordinate scale (e.g., 1000).")
     parser.add_argument('--device_tag', type=str, default='Android', help="Device tag used in prompts.")
     parser.add_argument('--max_prev_acts', type=int, default=6, help="Maximum number of previous actions in history.")
-    parser.add_argument('--original_actspace', action='store_true', help="Whether to use original AITW action space.")
+    parser.add_argument('--original_actspace', action='store_true', help="Whether to use original AITW action space. Ignore this to use the unified action space provided by UIPro.")
     
     args, _ = parser.parse_known_args()
     return args

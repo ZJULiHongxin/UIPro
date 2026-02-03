@@ -29,10 +29,13 @@
 ## 📢 News
 
 - **[2025-06-28]** 🎉 UIPro has been accepted to **ICCV 2025**!
-- **[2025-11-23]** Uploaded [UIPro models](https://huggingface.co/HongxinLi/UIPro_1stage).
+- **[2025-11-23]** Uploaded [UIPro Grounding models](https://huggingface.co/HongxinLi/UIPro_1stage).
 - **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, MultiUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
 - **[2025-11-27]** Uploaded data processing scripts, and systematic denoising procedures for SeeClick-Web, RefExp
 - **[2025-12-10]** Uploaded data processing scripts, and systematic denoising procedures for MOTIF, RefExp, and GUIEnv
+- **[2025-12-15]** Uploaded [UIPro Web Agent model](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Web) and [UIPro Mobile Agent model](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Mobile).
+- **[2026-02-03]** Uploaded evaluation scripts.
+
 - **[TODO]** Upload whole datasets
 
 ---
@@ -108,7 +111,7 @@ The training process involves a sophisticated pipeline designed to enhance both 
 
 ---
 
-<div align="center">
+
 
 ## 🚀 **Quick Start Guide**
 
@@ -625,6 +628,285 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 ```
 
 </details>
+
+---
+
+<div align="center">
+
+## 🧪 **Model Usage**
+
+</div>
+
+**Stage 1: GUI Element Grounding**
+
+Follow the code below to test the [stage 1 model for GUI element grounding](https://huggingface.co/HongxinLi/UIPro-7B_Stage1) evaluation.
+
+```
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# Default: Load the model on the available device(s)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    "HongxinLi/UIPro_1stage", torch_dtype="auto", device_map="auto"
+)
+processor = AutoProcessor.from_pretrained("HongxinLi/UIPro_1stage")
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": "./web_6f93090a-81f6-489e-bb35-1a2838b18c01.png",
+            },
+
+            # For ScreenSpot-v2, MOTIF, RefExp, and VisualWebBench Action Grounding
+            {"type": "text", "text": "I want to {goal_info}. Please locate the target element I should interact with. (Output the center coordinates of the target)"},
+            # For AutoGUI
+            {"type": "text", "text": "Locate the element according to its detailed functionality description. {goal_info} (Output the center coordinates of the target)"},
+            # For VisualWebBench Element Grounding
+            {"type": "text", "text": "Locate the text "{goal_info}" (Output the center coordinates of the target)"},
+        ],
+    }
+]
+
+```
+
+
+**Stage 2: Web Agent Embodiment**
+
+Follow the code below to test the [stage 2 model for Web agent](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Web) task evaluation.
+
+```
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# Default: Load the model on the available device(s)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    "HongxinLi/UIPro-7B_Stage2_Web", torch_dtype="auto", device_map="auto"
+)
+processor = AutoProcessor.from_pretrained("HongxinLi/UIPro-7B_Stage2_Web")
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": "./web_6f93090a-81f6-489e-bb35-1a2838b18c01.png",
+            },
+
+            {"type": "text", "text": """Given the Web UI screenshot and previous actions, please generate the next move necessary to advance towards task completion. The user's task is: {task}
+Action history: {action_history}
+
+Now, first describe the action intent and then directly plan the next action."""},
+        ],
+    }
+]
+
+```
+
+
+**Stage 2: Mobile Agent Embodiment**
+
+Follow the code below to test the [stage 2 model for Mobile agent](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Mobile) task evaluation.
+
+```
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# Default: Load the model on the available device(s)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    "HongxinLi/UIPro-7B_Stage2_Mobile", torch_dtype="auto", device_map="auto"
+)
+processor = AutoProcessor.from_pretrained("HongxinLi/UIPro-7B_Stage2_Mobile")
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": "./web_6f93090a-81f6-489e-bb35-1a2838b18c01.png",
+            },
+
+            {"type": "text", "text": """Given the Mobile UI screenshot and previous actions, please generate the next move necessary to advance towards task completion. The user's task is: {task}
+Action history: {action_history}
+
+Now, first describe the action intent and then directly plan the next action."""},
+        ],
+    }
+]
+
+```
+
+---
+
+<div align="center">
+
+## 🧪 **Reproducing Agentic Task Evaluation**
+
+*Run the agentic task evaluation scripts for AiTW / AndroidControl / GUIAct / Mind2Web.*
+
+</div>
+
+> **Note**
+> - These scripts perform **online action prediction** step-by-step (i.e., they will run model inference), so a GPU environment is recommended.
+> - Outputs are saved as JSON files under `utils/eval_utils/eval_results/`.
+
+<details>
+<summary><b>🤖 AiTW (Android in the Wild) — `utils/eval_utils/eval_aitw.py`</b></summary>
+<br>
+
+**What you need**
+- **AiTW screenshots** (see the *Agentic SFT Data Processing → Android in the Wild (AiTW)* section below). You only need the image folder for evaluation.
+- The script loads the **test annotations** from HuggingFace: `HongxinLi/AITW_test`.
+
+**Expected images layout**
+```
+/path/to/AITW/aitw_images/
+├── general/
+├── googleapps/
+├── install/
+├── single/
+└── webshopping/
+```
+
+**Run**
+
+```bash
+python utils/eval_utils/eval_aitw.py \
+  --pretrained "HongxinLi/UIPro_2stage_Mobile" \
+  --imgs_dir "/path/to/AITW/aitw_images" \
+  --action_refexp \
+  --scale 1000
+```
+
+**Common options**
+- `--debug`: only evaluate a few steps for quick sanity check
+- `--cot`: enable Chain-of-Thought prompting
+- `--action_refexp`: used to drive the UIPro model to output a short action intent before predicting the action function call.
+- `--max_prev_acts`: how many previous actions are included in history
+- `--original_actspace`: use the original AITW action space in prompts. Ignore this to use the unified action space provided by UIPro.
+
+**Outputs**
+- Saved to `utils/eval_utils/eval_results/AITW/<model_postfix>[_CoT][_wActRef]/<timestamp>.json`
+
+</details>
+
+<details>
+<summary><b>🎮 AndroidControl — `utils/eval_utils/eval_androidcontrol.py`</b></summary>
+<br>
+
+**What you need**
+- A local AndroidControl test JSON (e.g., the processed file produced by `utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py`).
+- The images should be reachable by joining `--data_root` with the `image` field in the test JSON.
+
+We also provide a preprocessed zip file of the AndroidControl test data used in the UIPro paper. First download and unzip the GoClick AndroidControl Test Data via
+`hf download HongxinLi/AndroidControl_test  --repo-type dataset --local-dir path/to/AndroidControl_test`
+
+**Run**
+```bash
+python utils/eval_utils/eval_androidcontrol.py \
+  --pretrained "HongxinLi/UIPro_2stage_Mobile" \
+  --testset_path "utils/eval_utils/AndroidControl-test_12685.json" \
+  --data_root "/path/to/AndroidControl"
+```
+
+**Useful options**
+- `--action_refexp`: (only used for UIPro) Please use this to prompt UIPro to output short reasoning before planning the action 
+
+**Outputs**
+- Saved to `utils/eval_utils/eval_results/androidcontrol/<model_postfix>/<timestamp>.json`
+
+</details>
+
+<details>
+<summary><b>🎭 GUIAct — `utils/eval_utils/eval_guiact.py`</b></summary>
+<br>
+
+**What you need**
+- A local GUIAct processed folder that contains the test JSON and images referenced by the `image` field.
+- You can pass `--root` to point to your processed GUIAct directory, and `--imgs_dir` to override the image base.
+  If omitted, the script auto-detects local/server paths inside `get_dataset_paths()` in `utils/eval_utils/eval_guiact.py`.
+
+We also provide the preprocessed GUIAct test data zip file. First download the GUIAct data from HongxinLi/GUIAct, unzip it, and organize it as follows:
+```
+root/
+├── GUICourse/
+│   └── GUIAct/
+│   │    └── imgs
+│   ├── Web_test.json
+│   └── Mobile_test.json
+```
+
+
+**Run**
+```bash
+python utils/eval_utils/eval_guiact.py \
+  --pretrained "HongxinLi/UIPro-7B_Stage2_Web" \
+  --device_type Web \
+  --scale 1000 \
+  --root "/path/to/GUICourse_processed" \
+  --imgs_dir "/path/to/images_base"
+```
+
+**Common options**
+- `--device_type`: `Web` or `Mobile`
+- `--root`: processed GUIAct directory (overrides auto-detect)
+- `--imgs_dir`: image base directory (overrides auto-detect)
+- `--debug`: evaluate a small random subset
+- `--cot`: enable Chain-of-Thought prompting
+- `--action_refexp`: (only used for UIPro) Please use this to prompt UIPro to output short reasoning before planning the action 
+- `--original_actspace`: use the original GUIAct action space
+
+**Outputs**
+- Saved to `utils/eval_utils/eval_results/GUIAct-<device_type>/<model_postfix>/<timestamp>.json`
+
+</details>
+
+<details>
+<summary><b>🌐 Mind2Web — `utils/eval_utils/eval_mind2web.py`</b></summary>
+<br>
+
+**What you need**
+- A local Mind2Web folder that contains:
+  - `mind2web_images/` (evaluation screenshots)
+  - `mind2web_data_test_{website|task|domain}.json` (test annotations)
+- You can pass `--root` to point to your local Mind2Web directory. If omitted, the script auto-selects
+  the first existing path in `DEFAULT_ROOTS` inside `utils/eval_utils/eval_mind2web.py`.
+
+**Expected layout**
+```
+/path/to/Mind2Web/
+├── mind2web_images/
+└── mind2web_data_test_website.json
+    mind2web_data_test_task.json
+    mind2web_data_test_domain.json
+```
+
+**Run**
+```bash
+python utils/eval_utils/eval_mind2web.py \
+  --pretrained "HongxinLi/UIPro-7B_Stage2_Web" \
+  --task website \
+  --scale 1000 \
+  --root "/path/to/Mind2Web"
+```
+
+**Common options**
+- `--task`: either 'task', 'domain', or 'website' (the three splits of Mind2Web)
+- `--debug`: only evaluate a few episodes
+- `--cot`: enable Chain-of-Thought prompting
+- `--action_refexp`: (only used for UIPro) Please use this to prompt UIPro to output short reasoning before planning the action 
+- `--max_prev_acts`: how many previous actions are included in history
+
+**Outputs**
+- Saved to `utils/eval_utils/eval_results/mind2web/<model_postfix>/{website|task|domain}-<timestamp>.json`
+
+</details>
+
+<div align="center">
 
 ---
 
