@@ -365,7 +365,7 @@ textloc_prompt = [
     "Locate the text \"{text}\""
 ]
 
-def make_textloc_sample(task_id, text, loc, output_tag='point', foramt=None):
+def make_textloc_sample(task_id, text, loc, output_tag=WITHPOINT_TAG, foramt=None):
     query = random.choice(textloc_prompt).format(text=text)
 
     if output_tag:
@@ -391,8 +391,8 @@ ocr_prompt = [
     "What is the text written on this UI element at {loc}?"
 ]
 
-def make_ocr_sample(task_id, text, loc, with_box=False):
-    query = random.choice(ocr_prompt).format(loc=loc + (WITHBOX_TAG if with_box else WITHPOINT_TAG))
+def make_ocr_sample(task_id, text, loc, output_tag=WITHPOINT_TAG):
+    query = random.choice(ocr_prompt).format(loc=loc + output_tag)
     
     conv = [
             {
@@ -412,8 +412,8 @@ elemclass_prompt = [
     "Classify the type of the element located at {loc}?"
 ]
 
-def make_elemclass_sample(task_id, elem_cls, loc, with_box=False):
-    query = random.choice(elemclass_prompt).format(loc=loc + (WITHBOX_TAG if with_box else WITHPOINT_TAG))
+def make_elemclass_sample(task_id, elem_cls, loc, output_tag=WITHPOINT_TAG):
+    query = random.choice(elemclass_prompt).format(loc=loc + output_tag)
     
     conv = [
             {
@@ -441,7 +441,7 @@ intentgnd_prompt = [
 def make_intentgnd_sample(task_id, intent, loc, output_tag=WITHPOINT_TAG, point_format='plain'):
     query = random.choice(intentgnd_prompt).format(intent)
 
-    if output_tag:
+    if output_tag and not output_tag.startswith(' '):
         output_tag = ' ' + output_tag
 
     loc_str = format_point_tag(loc, point_format)
@@ -523,8 +523,8 @@ iconref_prompt = [
     "Briefly describe the icon at {loc}."
 ]
 
-def make_iconref_sample(task_id, icon_desc, loc, with_box=False):
-    query = random.choice(iconref_prompt).format(loc=loc + (WITHBOX_TAG if with_box else WITHPOINT_TAG))
+def make_iconref_sample(task_id, icon_desc, loc, output_tag=WITHPOINT_TAG):
+    query = random.choice(iconref_prompt).format(loc=loc + output_tag)
     
     conv = [
             {

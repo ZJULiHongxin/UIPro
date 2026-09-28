@@ -29,12 +29,14 @@
 ## 📢 News
 
 - **[2025-06-28]** 🎉 UIPro has been accepted to **ICCV 2025**!
-- **[2025-11-23]** Uploaded [UIPro Grounding models](https://huggingface.co/HongxinLi/UIPro_1stage).
+- **[2025-11-23]** Uploaded [UIPro Grounding models](https://huggingface.co/HongxinLi/UIPro-7B_Stage1).
 - **[2025-11-23]** Uploaded data processing scripts, and systematic denoising procedures for AITW, AITZ, MobileViews, WAE, WebUI, MultiUI, AndroidControl, GUIOdyssey, AMEX, GUIAct
 - **[2025-11-27]** Uploaded data processing scripts, and systematic denoising procedures for SeeClick-Web, RefExp
 - **[2025-12-10]** Uploaded data processing scripts, and systematic denoising procedures for MOTIF, RefExp, and GUIEnv
 - **[2025-12-15]** Uploaded [UIPro Web Agent model](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Web) and [UIPro Mobile Agent model](https://huggingface.co/HongxinLi/UIPro-7B_Stage2_Mobile).
 - **[2026-02-03]** Uploaded evaluation scripts.
+- **[2026-05-21]** Released the processed [AndroidControl dataset](https://huggingface.co/datasets/HongxinLi/UIPro-AndroidControl-Data-v1) on HuggingFace. The script now generates **TextLoc / OCR / WidgetList** samples in addition to ActionPlanning / IntentGnd, with WAE-style invalid-element recording, leaf-only + status-bar ambiguity filters, per-sample point↔bbox format toggle (`PROB_BOX=0.3`), and a per-episode pickle cache that skips TensorFlow on re-runs.
+- **[2026-09-28]** Built and released the processed [RICO-SCA](https://huggingface.co/datasets/HongxinLi/UIPro-RICOSCA-Data-v1) and [Widget Captioning](https://huggingface.co/datasets/HongxinLi/UIPro-WidgetCaptioning-Data-v1) datasets, and linked all published training and evaluation dataset URLs in the README.
 
 - **[TODO]** Upload whole datasets
 
@@ -186,34 +188,77 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 
 > **Note**: We also implemented a systematic denoising procedure to ensure data quality, removing up to 29% of noise from some data sources.
 
+#### 🤗 Published Datasets on HuggingFace
+
+The processed datasets below are released publicly under [`HongxinLi`](https://huggingface.co/HongxinLi). Each repo bundles the full samples `.json`, a random `_sample.json` preview, an `_info.json` report, and the referenced images (`_images.zip`).
+
+| Dataset | Stage | HuggingFace |
+| :--- | :---: | :--- |
+| MobileViews | Understanding | [UIPro-MobileViews-SFT-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MobileViews-SFT-v1) |
+| WebUI | Understanding | [UIPro-WebUI-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-WebUI-Data-v1) |
+| MultiUI | Understanding | [UIPro-MultiUI-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MultiUI-Data-v1) |
+| SeeClick-Web | Understanding | [UIPro-SeeClickWeb-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-SeeClickWeb-Data-v1) |
+| GUIEnv (GUICourse) | Understanding | [UIPro-GUIEnv-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-GUIEnv-Data-v1) |
+| RefExp | Understanding | [UIPro-RefExp-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-RefExp-Data-v1) |
+| MOTIF | Understanding | [UIPro-MOTIF-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MOTIF-Data-v1) |
+| RICO-SCA | Understanding | [UIPro-RICOSCA-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-RICOSCA-Data-v1) |
+| Widget Captioning | Understanding | [UIPro-WidgetCaptioning-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-WidgetCaptioning-Data-v1) |
+| AndroidControl | Agent (CFT) | [UIPro-AndroidControl-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-AndroidControl-Data-v1) |
+
+> Each dataset's own section below repeats its link in the **Publishing to HuggingFace** step, alongside the exact command used to build it.
+
 #### GUI Understanding SFT Data Processing
 
 <details>
 <summary><b>📱 MobileViews</b></summary>
 <br>
 
+> **Prerequisite**: The processing script uses `pytesseract` for overlap-filtering OCR, which requires the system-level `tesseract` binary (the `pytesseract` PyPI package alone is not enough). Install it before running:
+> ```bash
+> # Debian/Ubuntu
+> sudo apt-get update && sudo apt-get install -y tesseract-ocr
+> # Or, into the active conda env without sudo:
+> conda install -c conda-forge tesseract
+> ```
+> Verify with `tesseract --version`. Without it the script crashes with `TesseractNotFoundError`.
+
 1. Download the MobileViews raw data from [HuggingFace](https://huggingface.co/datasets/mllmTeam/MobileViews) via:
    ```bash
    hf download mllmTeam/MobileViews --repo-type dataset --local-dir ./MobileViews
+
+   # Move the zipped image files and csv files under the created MobileViews folder
+   cd MobileViews
+   mv ./MobileViews_Screenshots_ViewHierarchies/Index_CSV/* .
+   mv MobileViews_Screenshots_ViewHierarchies/Zip_Files/* ./
    ```
+
 2. Unzip and organize the data as follows:
    ```
    root/
    ├── MobileViews/
    │   ├── MobileViews_0-150000/
-   │   ├── MobileViews_0-150000.csv
+   │   ├── MobileViews_index_0-150000.csv
    │   ├── MobileViews_150001-291197/
-   │   ├── MobileViews_150001-291197.csv
+   │   ├── MobileViews_index_150001-291197.csv
    │   └── ...
    ```
    
-3. Modify `MOBILEVIEWS_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py`.
-4. Run the processing script (this may take ~48 hours due to the large number of screenshots):
+3. Modify the top-of-file configuration in `utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py`:
+   - **Paths**: `MOBILEVIEWS_DIR`, `ROOT`.
+   - **Coordinates**: `SCALE` (coordinate scale), `PROB_BOX` (proportion of box-prediction samples).
+   - **Task switches**: `TEXTLOC`, `OCR`, `INTENTGND`, `WIDGETLIST` (enable/disable per-task sample generation).
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). Set to `1` to force the sequential code path — useful when debugging or when the tesseract subprocess load thrashes the machine.
+
+4. Run the processing script. With multiprocessing the wall-clock time drops sharply versus the previous single-process build:
    ```bash
    python utils/data_utils/make_mobileviews_data/extract_and_generate_mobilebiews_data.py
    ```
-   Processed training samples will be saved in `ROOT/mobileviews_processed`.
-5. Finally, run `utils/data_utils/make_mobileviews_data/run_generate_symlinks.sh` to create a unified folder for screenshots.
+   Processed training samples land in `ROOT/mobileviews_processed/` along with:
+   - `mobileviews_<flags>_scale<S>_<N>k.json` — the full dataset.
+   - `…_sample.json` — a small random preview for quick inspection.
+   - `…_info.json` — a structured report with `images` / `elements` / `samples.by_task` / `per_part` / `top_packages` / `errors_summary` sections plus a plain-text `report` field. Watch for the loud `⚠ N worker exceptions caught` block at the end of stdout — if it shows up with `[HIGH]`, check `errors_summary` in the info JSON before trusting the counts.
+
+5. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-MobileViews-SFT-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-MobileViews-SFT-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MobileViews-SFT-v1)).
 
 </details>
 
@@ -258,13 +303,36 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │   ├── WebUI_screenshots (A folder used to save processed GUI screenshots)
    ```
 
-3. Modify `WEBUI_DIR`, `WEBUI_PROCESSED_IMG_DIR`, `ROOT`, `SCALE` (coordinate scale), and `PROB_BOX` (proportion of the box-prediction samples) in `utils/data_utils/make_webui_data/make_webui_data.py`.
+3. Modify the top-of-file configuration in `utils/data_utils/make_webui_data/make_webui_data.py`:
+   - **Paths**: `WEBUI_DIR`, `WEBUI_PROCESSED_IMG_DIR`, `ROOT`.
+   - **Coordinates**: `SCALE`, `PROB_BOX`, `LONGEST` (longest-edge resize, `-1` disables).
+   - **Task switches**: `ICONGND` / `ICONREF` / `ELEMGND` / `ELEMREF` / `ELEMCLASS` / `INTENTGND` / `WIDGETLIST` — toggle the tasks you want generated. `ELEMCLASS=True` also triggers a class-balancing pass that down/upsamples to the 75th percentile.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`) and `CHECKPOINT_EVERY` (how often `invalid_elem_record.json` is flushed during the run). Set `NUM_WORKERS=1` or `DRAW=True` to force the sequential path.
+   - **Debug**: `DEBUG=True` processes only the first 1000 sample-dirs — recommended for an initial smoke test.
 
-4. Run the processing script (this may take ~24 hours due to the large number of screenshots):
-   ```
+4. Run the processing script:
+   ```bash
    python utils/data_utils/make_webui_data/make_webui_data.py
    ```
-   Processed training samples will be saved in `ROOT/WebUI_processed`.
+   With multiprocessing enabled the long tail of ~348k sample-dirs completes in hours rather than days. Outputs land in `ROOT/WebUI_processed/`:
+   - `WebUI_scale<S>_<N>k.json` — the full dataset (samples have globally-renumbered IDs).
+   - `…_sample.json` — random preview (160 samples).
+   - `…_info.json` — structured report with `images` / `elements` (cumulative) / `samples.by_task` / `run_stats` (per-run) / `elem_class_stats_before_rebalance` / `errors_summary` / plain-text `report`.
+
+5. **Persistent state across runs**. The script keeps two cumulative files in `ROOT/WebUI_processed/` so the reported ratios stay coherent across multiple invocations:
+   - `invalid_elem_record.json` — set of all sample identifiers ever marked invalid (used for the cumulative invalid count).
+   - `cumulative_stats.json` — cumulative `iterated_elem_cnt` / `processed_img_cnt` / `valid_img_cnt`.
+
+   **Delete both files together** to reset the lifetime tallies. If you only delete one you'll see a `⚠ BUG` flag in the ratio cell because the numerator and denominator will be on different scopes.
+
+6. **Watching for regressions**. The script prints a grouped error summary at the end of every run:
+   ```
+   ⚠ 2,143 worker exceptions caught (0.6% of sample-dirs). Top error patterns:
+       2,143  UnboundLocalError: cannot access local variable 'loc' …
+   ```
+   If you see `[HIGH]` (>1% of sample-dirs errored) or the sample count drops sharply from a previous run, check `errors_summary` in `_info.json` for the root cause before training on the output.
+
+7. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-WebUI-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-WebUI-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-WebUI-Data-v1)).
 
 </details>
 
@@ -272,7 +340,7 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 <summary><b>📱 MultiUI</b></summary>
 <br>
 
-1. Download the MultiUI raw data from [neulab/MultiUI](https://huggingface.co/datasets/neulab/MultiUI).
+1. Download the MultiUI raw data from [neulab/MultiUI](https://huggingface.co/datasets/neulab/MultiUI) via `hf download neulab/MultiUI --repo-type=dataset --local-dir ./MultiUI`.
 
 2. Merge, unzip and organize the data as follows:
    ```
@@ -286,13 +354,28 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    |   ├── stage2_data_to_be_combined_with_general_data.json
    ```
 
-3. Modify `MULTIUI_SAMPLE_FILE`, `IMG_DIR`, `SAVE_ROOT`, and `SCALE` (coordinate scale) in `utils/data_utils/make_multiui_data/make_multiui_data.py`.
+3. Modify the top-of-file configuration in `utils/data_utils/make_multiui_data/make_multiui_data.py`:
+   - **Paths**: `MULTIUI_SAMPLE_FILE`, `IMG_DIR`, `SAVE_ROOT`.
+   - **Coordinates**: `SCALE` (coordinate scale).
+   - **Task switches**: `ENABLE_UI_CAPTION` / `ENABLE_WEBQA` / `ENABLE_OCR` / `ENABLE_GROUNDING` — toggle which task families get generated.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). Set to `1` to force the sequential code path when debugging.
+   - **Debug**: `DEBUG=True` processes a sampled subset (~1/1250 of rows) for a quick smoke test.
 
-4. Run the processing script (this may take ~2 hours due to the large number of screenshots):
-   ```
+4. Run the processing script (the per-sample image-dimension I/O dominates wall-clock time, so multiprocessing gives a large speed-up):
+   ```bash
    python utils/data_utils/make_multiui_data/make_multiui_data.py
    ```
-   Processed training samples will be saved in `ROOT/MultiUI_processed`.
+   Two output splits land in `ROOT/MultiUI_processed/`, each with a unified sibling `_info.json` (structured `images` / `elements` / `samples.by_task` / `errors_summary` / report sections) and a `_sample.json` preview:
+   - `MultiUI_gnd_ref_qa_scale<S>_<N>k.json` — grounding / QA / OCR samples.
+   - `MultiUI_caption_<N>k.json` — UI caption samples (only if `ENABLE_UI_CAPTION=True`).
+
+5. **Quality-control notes**:
+   - The grounding path performs a **blank-element check**: bounding-boxes whose pixel region is a pure colour are dropped and counted in `elements.invalid_breakdown.blank_elem`.
+   - Failed query extractions (e.g. malformed prompts) land in `invalid_breakdown.noquery_elem`.
+   - The cumulative `invalid_elem` IDs are persisted to `stats.json` so subsequent runs skip them automatically.
+   - Watch stdout for the `⚠ N worker exceptions caught` block at the end; `[HIGH]` (>1% of tasks) usually means a config/path problem worth fixing before training.
+
+6. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-MultiUI-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-MultiUI-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MultiUI-Data-v1)).
 
 </details>
 
@@ -311,23 +394,41 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    | ...
    ```
 
-3. Modify `IMG_DIR`, `ANNO_FILE`, `SAVE_ROOT`, and `SCALE` (coordinate scale) in `utils/data_utils/make_seeclickweb_data/make_seeclickweb_data.py`.
+3. Modify the top-of-file configuration in `utils/data_utils/make_seeclickweb_data/make_seeclickweb_data.py`:
+   - **Paths**: `IMG_DIR`, `ANNO_FILE`, `SAVE_ROOT`.
+   - **Coordinates**: `SCALE` (coordinate scale).
+   - **Task switches**: `ELEMGND` (element grounding: text → location) and `ELEMREF` (element referring: location → text). When both are `True`, each valid element yields two samples (one per task). `USE_ACTION_PROMPT=True` overrides both and emits a single action-planning sample instead.
+   - **Validation**: `SKIP_CHECKING=True` bypasses the pure-colour / duplicate / size checks for a faster, lower-quality run.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`) and `CHECKPOINT_EVERY` (how often `invalid_elem_record.json` is flushed). Set `NUM_WORKERS=1` to force sequential.
 
-4. Run the processing script (this may take ~24 hours due to the large number of screenshots):
-   ```
+4. Run the processing script (multiprocessing brings the wall-clock from ~24 h down to a few hours on a typical workstation):
+   ```bash
    python utils/data_utils/make_seeclickweb_data/make_seeclickweb_data.py
    ```
-   Processed training samples will be saved in `ROOT/SeeClick-Web_processed`.
+   Outputs land in `ROOT/SeeClick-Web_processed/` and the filename encodes the enabled tasks so different flag combinations don't overwrite each other:
+   - `SeeClick-Web_ElemGnd_ElemRef_<N>k.json` (both tasks)
+   - `SeeClick-Web_ElemGnd_<N>k.json` / `SeeClick-Web_ElemRef_<N>k.json` (one task)
+   - `SeeClick-Web_actformat_<N>k.json` (action-planning shortcut)
+
+   Each output gets a sibling `_sample.json` preview and a `_info.json` with structured `images` / `elements` / `samples.by_task` / `errors_summary` sections plus a plain-text `report`.
+
+5. **Persistent state across runs**: the script keeps `invalid_elem_record.json` in `SAVE_ROOT` — a cumulative skip-list of sample identifiers that have already been rejected. Re-runs benefit automatically (O(1) lookup at start, broadcast to every worker via a Pool initializer). Delete the file to reset.
+
+6. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-SeeClickWeb-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-SeeClickWeb-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-SeeClickWeb-Data-v1)).
 
 </details>
 
 <details>
-<summary><b>📱 GUIEnv</b></summary>
+<summary><b>📱 GUIEnv (GUICourse subtask)</b></summary>
 <br>
+
+> **Prerequisite**: GUIEnv runs `pytesseract` against every candidate element to validate OCR annotations. Install the `tesseract` system binary first (see the [MobileViews prerequisite block](#-mobileviews) for instructions) — `pip install pytesseract` alone is not enough.
+
+All three GUICourse subtasks (GUIEnv / GUIChat / GUIAct) are handled by the same script (`utils/data_utils/make_guicourse_data/make_guicourse_data.py`) under one `DatasetConfig`; the `SUBTASK` list controls which subtasks run in a given invocation.
 
 1. Download the GUIEnv raw data from [yiye2023/GUIEnv](https://huggingface.co/datasets/yiye2023/GUIEnv).
 
-2. Unzip and organize the data as follows:
+2. Unzip and organise the data as follows:
    ```
    root/
    │   └── GUICourse/
@@ -339,22 +440,63 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │                    ├── ocr_grounding_train_stage1_data.json
    │                    ├── ocr_grounding_test_images.parquet
    │                    └── ocr_grounding_test_data.json
-
    ```
 
-3. Modify `SUBTASK`, `CURRENT_SPLIT`, `DATA_ROOT`, `SAVE_DIR`, `ENABLE_TEXTLOC`, `ENABLE_OCR`, `ENABLE_INTENT_GND`, and `SCALE` (coordinate scale) in `utils/data_utils/make_refexp_data/make_refexp_data.py`.
+3. Edit the `DatasetConfig` class at the top of `utils/data_utils/make_guicourse_data/make_guicourse_data.py`:
+   - **Subtask selection**: `SUBTASK = ['GUIEnv']` (add `'GUIChat'` / `'GUIAct'` to run more in one shot).
+   - **Paths**: `DATA_ROOT`, `SAVE_DIR`.
+   - **Coordinates**: `SCALE`, `BOUNDING_BOX_PROBABILITY`.
+   - **Split**: `CURRENT_SPLIT` (`'train'` / `'test'`).
+   - **Task switches**: `ENABLE_TEXTLOC`, `ENABLE_OCR` — toggle which of the two per-element variants get emitted.
+   - **Validation**: `SKIP_VALIDATION=True` bypasses the size / box / pure-colour / OCR-similarity checks for a faster, lower-quality run.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). Parquet read + base64 image decoding stay on the main process (cheap, one-time per shard); the per-image-group validation and sample-construction work fans out across the pool. Set `NUM_WORKERS=1` to force the sequential code path.
+   - **Debug**: `DEBUG_MODE=True` only matters for GUIAct (sub-samples 1-in-100 trajectories).
 
-4. Run the processing script:
+4. Run the script:
+   ```bash
+   python utils/data_utils/make_guicourse_data/make_guicourse_data.py
    ```
-   python utils/data_utils/make_refexp_data/make_refexp_data.py
+   Outputs land in `SAVE_DIR`:
+   - `guienv-<split>-s<SCALE>-<N>.json` — full dataset (sample IDs renumbered globally per-prefix after parallel aggregation).
+   - `…_sample.json` — 256-sample preview.
+   - `…_info.json` — structured report with `images` / `elements` (with `invalid_breakdown`) / `samples.by_task` (`TextLoc` + `OCR`) / `errors_summary` / plain-text `report`.
+
+5. **Persistent state across runs**: the script keeps `invalid_elem_record.json` in `SAVE_DIR` — a cumulative skip-list of sample identifiers that have been rejected (too-small box, blank region, OCR mismatch, …). Broadcast to every worker via a Pool initialiser for O(1) lookups; delete the file to reset.
+
+6. **Watching for regressions**: a `⚠ N worker exceptions caught` block is printed at the end of every run; the `[HIGH]` flag (>1% of items) usually means a path / permission / encoding issue worth fixing before training.
+
+7. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-GUIEnv-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-GUIEnv-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-GUIEnv-Data-v1)).
+
+</details>
+
+<details>
+<summary><b>📱 GUIChat (GUICourse subtask)</b></summary>
+<br>
+
+Conversational GUI samples with bounding-box annotations. Generated by the same `make_guicourse_data.py` script with `SUBTASK` including `'GUIChat'`.
+
+1. Download the GUIChat parquet shards (and matching `data.json` files) from the [GUICourse](https://huggingface.co/datasets/yiye2023/GUICourse) collection and place them at `DATA_ROOT/GUIChat/*.parquet`.
+
+2. Add `'GUIChat'` to `DatasetConfig.SUBTASK`. The chat path doesn't have its own task switches — `SCALE` (coordinate scale) and `NUM_WORKERS` are the only knobs that affect output.
+
+3. Run the script:
+   ```bash
+   python utils/data_utils/make_guicourse_data/make_guicourse_data.py
    ```
-   Processed training samples will be saved in `ROOT/RefExp_processed`.
+   Per-image cv2.imread + bounding-box normalisation is the slow path; parallelisation gives a meaningful speed-up here. Outputs land in `SAVE_DIR`:
+   - `guichat-<split>-s<SCALE>-<N>.json` (full dataset) + `_sample.json` (256-row preview) + `_info.json` (unified report with `samples.by_task.WebQA` + `errors_summary`).
 
 </details>
 
 <details>
 <summary><b>📱 RefExp</b></summary>
 <br>
+
+> **Prerequisite**: RefExp uses spaCy's medium English model (`en_core_web_md`) to classify each instruction as "element" (no verb → element-grounding task) or "intent" (has an action verb → intent-grounding task). Install it once:
+> ```bash
+> python -m spacy download en_core_web_md
+> ```
+> A pre-flight check in the script fails fast with this exact command if the model is missing — without it, every Pool worker would crash with `OSError: [E050] Can't find model 'en_core_web_md'`.
 
 1. Download the RICO image data from [SeeClick RICO Data](https://box.nju.edu.cn/f/7ae5e9bd4bf840d4add3/).
 
@@ -369,13 +511,30 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 
    ```
 
-3. Modify `IMG_DIR`, `SAVE_ROOT`, , and `SCALE` (coordinate scale) in `utils/data_utils/make_refexp_data/make_refexp_data.py`.
+3. Modify the top-of-file configuration in `utils/data_utils/make_refexp_data/make_refexp_data.py`:
+   - **Paths**: `IMG_DIR`, `SAVE_ROOT`.
+   - **Coordinates**: `SCALE`, `OUTPUT_TAG` (optional output-format hint appended to the prompt).
+   - **Task format**: `USE_ACTION_PROMPT=True` swaps intent grounding for action-planning samples (Aguvis format).
+   - **Validation**: `SKIP_CHECKING=True` skips the size / box / pure-colour checks.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). Each worker loads one `VerbExtactor` (spaCy) at startup — that's a ~1-2 s per-worker cost paid once. Set `NUM_WORKERS=1` to force sequential while debugging.
+   - **Debug**: `DEBUG=True` processes only the first 200 samples.
 
 4. Run the processing script:
-   ```
+   ```bash
    python utils/data_utils/make_refexp_data/make_refexp_data.py
    ```
-   Processed training samples will be saved in `ROOT/RefExp_processed`.
+   Outputs land in `ROOT/RefExp_processed/`:
+   - `RefExp_s<S>_<N>k.json` — the full dataset (sample IDs are renumbered globally per-prefix after parallel aggregation, so they're unique and contiguous).
+   - `…_sample.json` — random preview for quick inspection.
+   - `…_info.json` — structured report with `images` / `elements` / `samples.by_task` (`ElemGnd` + `IntentGnd`) / `errors_summary` / plain-text `report`.
+
+5. **Persistent state across runs** (in `SAVE_ROOT`):
+   - `invalid_elem_record.json` — cumulative skip-list of rejected sample identifiers.
+   - `instruc_type_record.json` — cache of instruction → first-verb mappings. Seeded into every worker via the Pool initializer so re-runs skip the spaCy parse for known instructions.
+   
+   Delete either file to reset that cache.
+
+6. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-RefExp-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-RefExp-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-RefExp-Data-v1)).
 
 </details>
 
@@ -392,13 +551,121 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 
    ```
 
-3. Modify `IMG_DIR`, `SAVE_ROOT_DIR`, and `SCALE` (coordinate scale) in `utils/data_utils/make_motif_data/make_motif_data.py`.
+3. Modify the top-of-file configuration in `utils/data_utils/make_motif_data/make_motif_data.py`:
+   - **Paths**: `IMG_DIR`, `SAVE_ROOT_DIR`.
+   - **Coordinates**: `SCALE`, `OUTPUT_TAG` (optional output-format hint).
+   - **Task format**: `USE_ACTION_PROMPT=True` formats samples as action-planning (Aguvis) instead of intent grounding.
+   - **Validation**: `SKIP_CHECKING=True` skips the size / box / pure-colour / swipe-filter checks.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). Set `NUM_WORKERS=1` to force the sequential code path while debugging.
+   - **Debug**: `DEBUG=True` processes only the first 200 rows.
 
-4. Run the processing script:
-   ```
+4. Run the processing script (file-I/O bound per row, so multiprocessing helps a lot on networked storage):
+   ```bash
    python utils/data_utils/make_motif_data/make_motif_data.py
    ```
-   Processed training samples will be saved in `ROOT/MOTIF_processed`.
+   Outputs land in `ROOT/MOTIF_processed/`:
+   - `MOTIF_<N>k<flags>.json` — full dataset (`<flags>` is `_debug` / `_actformat` when those are set; sample IDs are renumbered globally after parallel aggregation).
+   - `…_sample.json` — random preview.
+   - `…_info.json` — structured report with `images` / `elements` / `samples.by_task` (`IntentGnd`) / `invalid_breakdown` (`too_small_element`, `blank_elem`, `invalid_elem_content`, …) / `errors_summary` / plain-text `report`.
+
+5. **Persistent state across runs**: the script keeps `invalid_elem_record.json` in `SAVE_ROOT_DIR` — a cumulative skip-list of sample identifiers that have already been rejected. The Pool initializer broadcasts it as a frozenset to every worker for O(1) lookups. Delete the file to reset.
+
+6. **Publishing to HuggingFace**: bundle the produced JSON + referenced images into a dataset repo with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-MOTIF-Data-v1` → [https://huggingface.co/datasets/HongxinLi/UIPro-MOTIF-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-MOTIF-Data-v1)).
+
+</details>
+
+<details>
+<summary><b>📱 RICO-SCA</b></summary>
+<br>
+
+> **Prerequisite**: This script uses `python-magic` to read image dimensions from file headers, which requires the system-level `libmagic` library (the `python-magic` PyPI package alone is not enough). Install it before running:
+> ```bash
+> # Debian/Ubuntu
+> sudo apt-get update && sudo apt-get install -y libmagic1
+> # Or, into the active conda env without sudo:
+> conda install -c conda-forge libmagic
+> ```
+> Without it the script crashes at import with `ImportError: failed to find libmagic`.
+
+RICO-SCA provides single-instruction referring/grounding annotations over the RICO screenshots (the same image set used by RefExp and MOTIF), which we convert into intent-grounding samples.
+
+> **Note on the published release**: [HongxinLi/UIPro-RICOSCA-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-RICOSCA-Data-v1) is built from the **train split** of the public RICO-SCA annotations (173k caption→grounding samples over 18k screens). The paper's Table 1 count (295k) additionally counts held-out splits and multi-phrasing expansion; the published train release is the reproducible core used for the understanding stage.
+
+1. Download the RICO image data from [SeeClick RICO Data](https://box.nju.edu.cn/f/7ae5e9bd4bf840d4add3/) and the RICO-SCA annotation file (`ricosca.json`) from [SeeClick](https://github.com/njucckevin/SeeClick).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   ├── rico/
+   │   ├── 72197.jpg
+   │   └── ...
+   └── ricosca.json
+   ```
+
+3. Modify the top-of-file configuration in `utils/data_utils/make_ricosca_data/make_ricosca_data.py`:
+   - **Paths**: `IMG_DIR`, `ANNO_FILE`, `SAVE_ROOT`.
+   - **Coordinates**: `SCALE` (coordinate scale).
+   - **Task format**: `USE_ACTION_PROMPT=True` emits action-planning (Aguvis) samples instead of intent grounding.
+   - **Validation**: `SKIP_CHECKING=True` (default) bypasses the swipe-filter / size / box / pure-colour checks for a faster run.
+   - **Debug**: `DEBUG=True` processes only the first 200 rows.
+
+4. Run the processing script:
+   ```bash
+   python utils/data_utils/make_ricosca_data/make_ricosca_data.py
+   ```
+   Outputs land in `ROOT/RICOSCA_processed/`:
+   - `RICOSCA_<N>k<flags>.json` — full dataset (`<flags>` is `_debug` / `_actformat` when set).
+   - `…_sample.json` — random preview.
+   - `…_info.json` — structured report (`images` / `elements` / `samples.by_task` (`IntentGnd`) / `invalid_breakdown`) plus a plain-text `report`.
+
+5. **Persistent state across runs**: the script keeps `invalid_elem_record.json` in `SAVE_ROOT` — a cumulative skip-list of rejected sample identifiers. Delete it to reset.
+
+6. **Publishing to HuggingFace**: bundle the produced JSON + referenced images with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-RICOSCA-Data-v1`). A pre-processed release (173k intent-grounding samples, train split) is available at [HongxinLi/UIPro-RICOSCA-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-RICOSCA-Data-v1).
+
+</details>
+
+<details>
+<summary><b>📱 Widget Captioning</b></summary>
+<br>
+
+> **Prerequisite**: Like RICO-SCA, this script uses `python-magic`, which needs the system-level `libmagic` library (see the [RICO-SCA prerequisite block](#-rico-sca) for install instructions). It **additionally** requires spaCy's medium English model, used to classify each caption's leading verb:
+> ```bash
+> python -m spacy download en_core_web_md
+> ```
+> Without it the script crashes with `OSError: [E050] Can't find model 'en_core_web_md'`.
+
+Widget Captioning pairs each RICO widget with a natural-language caption, which we turn into element-grounding, intent-grounding, and (optionally) element-referring samples.
+
+> **Note on the published release**: [HongxinLi/UIPro-WidgetCaptioning-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-WidgetCaptioning-Data-v1) is built from the **train split** (109k samples: ~63k intent-grounding + ~46k element-grounding over 15k screens); the paper's Table 1 count (163k) additionally counts held-out splits. The train/val/test splits are kept separate so the eval widgets stay held out.
+
+1. Download the RICO image data from [SeeClick RICO Data](https://box.nju.edu.cn/f/7ae5e9bd4bf840d4add3/) and the Widget Captioning annotation file (`widget_captioning.json`) from the [Widget Captioning dataset](https://github.com/google-research/google-research/tree/master/widget_caption).
+
+2. Unzip and organize the data as follows:
+   ```
+   root/
+   ├── rico/
+   │   ├── 72197.jpg
+   │   └── ...
+   └── widget_captioning.json
+   ```
+
+3. Modify the top-of-file configuration in `utils/data_utils/make_widget_captioning_data/make_widcap_data.py`:
+   - **Paths**: `IMG_DIR`, `ANNO_FILE`, `SAVE_ROOT`.
+   - **Coordinates**: `SCALE` (coordinate scale).
+   - **Task switches**: `ELEMREF` toggles element-referring (location → caption) sample generation; element grounding and intent grounding are always produced. `USE_ACTION_PROMPT=True` emits action-planning (Aguvis) samples instead.
+   - **Validation**: `SKIP_CHECKING=True` (default) bypasses the size / box / pure-colour checks.
+   - **Debug**: `DEBUG=True` processes only the first 200 rows.
+
+4. Run the processing script:
+   ```bash
+   python utils/data_utils/make_widget_captioning_data/make_widcap_data.py
+   ```
+   Outputs land in `ROOT/WidgetCaptioning_processed/`:
+   - `WidgetCaptioning_<N>k<flags>.json` — full dataset.
+   - `…_sample.json` — random preview.
+   - `…_info.json` — structured report with per-task counters (`intentgnd_cnt` / `elemgnd_cnt` / `elemref_cnt`) plus a plain-text `report`.
+
+5. **Publishing to HuggingFace**: bundle the produced JSON + referenced images with `utils/data_utils/push_data_to_hf.py` (e.g. `--repo-id HongxinLi/UIPro-WidgetCaptioning-Data-v1`). A pre-processed release (109k grounding samples, train split) is available at [HongxinLi/UIPro-WidgetCaptioning-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-WidgetCaptioning-Data-v1).
 
 </details>
 
@@ -504,12 +771,39 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │   │   ├── android_control-00019-of-00020
    │   │   └── splits.json
    ```
-3. Modify `ANDROIDCONTROL_ROOT`, `SAVE_DIR`, `SPLIT`, and `POINT_FORMAT` in `utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py`.
+3. Edit the top of `utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py`:
+   - **Paths**: `ANDROIDCONTROL_ROOT`, `SAVE_DIR`.
+   - **Split / coordinates**: `SPLIT` (`'train'` / `'test'`), `SCALE`, `LONGEST`, `POINT_FORMAT` (`'plain'` / `'qwen'`).
+   - **Task switches**:
+     - `PLANNING` — high-level and high+low-level action-planning samples (per step).
+     - `INTENTGND` — intent-grounding samples for click / long-press steps.
+     - `TEXTLOC` / `OCR` / `WIDGETLIST` — element-level samples derived from each step's accessibility tree (added in this update; mirror the WAE / webui task generators).
+     - `PROB_BOX = 0.3` — per-sample probability of emitting the answer as a bounding box rather than a center point (applies to TextLoc, OCR, and IntentGnd; the question's `(with bbox)` / `(with point)` suffix tracks the format so prompt and answer never disagree).
+     - `USE_ACTION_REFEXP`, `DISCARD_OPENAPP`, `ADD_DUMMY_COMPLETE`, `RETAIN_STATUSBAR_IN_XML`, `DEVICE_TAG` — auxiliary planning knobs.
+   - **Parallelism**: `NUM_WORKERS` (default = 8; the per-episode body is dispatched to a `spawn`-method `multiprocessing.Pool` of TF-free workers, so memory cost stays modest). Set `NUM_WORKERS=1` to force sequential / enable `DRAW`.
+   - **Debug**: `DEBUG=True` takes the first 30 episodes only.
+
 4. Run the script:
    ```bash
    python utils/data_utils/make_androidcontrol_data/make_androidcontrol_data.py
    ```
-   Processed samples will be saved in `SAVE_DIR/AndroidControl_processed`.
+   The **first run** walks the gzipped TFRecord stream once and writes a per-episode pickle cache at `ANDROIDCONTROL_ROOT/_episode_cache/{ep_id}.pkl` plus a `_complete.marker` sentinel. **Subsequent runs** skip TensorFlow entirely and load episodes directly from the cache — orders of magnitude faster. Delete `_complete.marker` to force a rebuild.
+
+   Outputs land in `SAVE_DIR` (default `…/AndroidControl/`):
+   - `AndroidControl[_test]_s<SCALE>_<N>.json` — full dataset (filename varies with enabled flags).
+   - `…_sample.json` — 160-sample preview.
+   - `…_info.json` — unified report with `images` / `elements` / `samples.by_task` (`ActionPlanning` + `IntentGnd` + `TextLoc` + `OCR` + `WidgetList`) / `errors_summary` + plain-text `report`.
+   - `invalid_elem_record.json` — WAE-style cumulative `{bucket: [sample_id, …]}` record of every rejected node, keyed by `"{short_img_path}|{win_idx}|{box}"`. Buckets use the canonical names from `task_prompt_lib` (`overlapping element`, `invalid box coordinates`, `too small element`, `oversized element`, `invalid element content`, `element not displayed`, plus the AndroidControl-specific `UIs without main app windows`).
+
+5. **Ambiguity & targeting safeguards** (newly tightened): for the three element-level grounding tasks, only **leaf** nodes outside the status-bar window are valid targets, and the per-screen uniqueness check (`<= 1` occurrence in the candidate list) is also restricted to that same leaf set. This prevents (a) container/leaf duplicates (a `View` wrapping a `TextView` with the same content-desc) from falsely flagging unique leaves as ambiguous, and (b) status-bar elements (battery / wifi / clock / notification icons) from dominating the sample distribution. WidgetList is intentionally left alone — it serializes the whole screen as an overview.
+
+6. **Publishing the processed dataset to HuggingFace**: the released artifacts live at [HongxinLi/UIPro-AndroidControl-Data-v1](https://huggingface.co/datasets/HongxinLi/UIPro-AndroidControl-Data-v1). To upload your own run, point `--samples` at the produced JSON and `--images-root` at the parent of the image folders:
+   ```bash
+   python utils/data_utils/push_data_to_hf.py \
+       --samples /path/to/data/AndroidControl/AndroidControl_s1000_<N>.json \
+       --images-root /path/to/data \
+       --repo-id HongxinLi/UIPro-AndroidControl-Data-v1
+   ```
 
 </details>
 
@@ -563,11 +857,17 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
 </details>
 
 <details>
-<summary><b>🎭 GUIAct</b></summary>
+<summary><b>🎭 GUIAct (GUICourse subtask)</b></summary>
 <br>
 
-1. Download raw data from the [GUIAct HF Repo](https://huggingface.co/datasets/yiye2023/GUIAct) by running `hf download yiye2023/GUIAct --repo-type dataset --local-dir path/to/GUICourse/GUIAct`.
-2. Organize the data:
+Action-planning samples derived from full task trajectories. Generated by the same `make_guicourse_data.py` script.
+
+1. Download raw data from the [GUIAct HF Repo](https://huggingface.co/datasets/yiye2023/GUIAct):
+   ```bash
+   hf download yiye2023/GUIAct --repo-type dataset --local-dir path/to/GUICourse/GUIAct
+   ```
+
+2. Organise the data:
    ```
    root/
    ├── GUICourse/
@@ -577,12 +877,26 @@ We provide comprehensive scripts to process various GUI datasets. Please follow 
    │   │   ├── smartphone_train_data.json
    │   │   └── ...
    ```
-3. Modify `DATA_ROOT`, `SAVE_DIR`, `CURRENT_SPLIT`, and `CURRENT_DEVICE_TYPE` in the `DatasetConfig` class within `utils/data_utils/make_guicourse_data/make_guicourse_data.py`.
+
+3. Edit `DatasetConfig` in `utils/data_utils/make_guicourse_data/make_guicourse_data.py`:
+   - **Subtask selection**: `SUBTASK = ['GUIAct']`.
+   - **Paths**: `DATA_ROOT`, `SAVE_DIR`.
+   - **Split / device**: `CURRENT_SPLIT` (`'train'` / `'test'`) and `CURRENT_DEVICE_TYPE` (`'smartphone'` / `'web'`).
+   - **Output format**: `USE_ACTION_REFEXP=True` prefixes each generated action with a Qwen-style natural-language reference expression; `ENABLE_INTENT_GND=True` opts into the extra intent-grounding sample per click.
+   - **History**: `MAX_PREVIOUS_ACTIONS=3` caps how many prior step instructions are folded into a step's `history` field.
+   - **Parallelism**: `NUM_WORKERS` (default = `cpu_count − 1`). **Each trajectory is dispatched to a worker** (steps within a trajectory remain sequential since they share `step_instructions` state), so the speed-up scales with the number of trajectories rather than the number of steps.
+   - **Debug**: `DEBUG_MODE=True` keeps every 100th trajectory only — handy for a quick smoke test.
+
 4. Run the script:
    ```bash
    python utils/data_utils/make_guicourse_data/make_guicourse_data.py
    ```
-   Processed samples will be saved in `SAVE_DIR`.
+   Outputs land in `SAVE_DIR`:
+   - `guiact-<split>-<device>[-wActRef]-s<SCALE>-<N>.json` — full dataset (sample IDs renumbered globally after parallel aggregation).
+   - `…_sample.json` — 256-sample preview.
+   - `…_info.json` — unified report with `images` / `elements` / `samples.by_task` (`ActionPlanning` + optional `IntentGnd`) / `errors_summary` / plain-text `report`.
+
+5. **Watching for regressions**: same `⚠ N worker exceptions caught` end-of-run block as the other GUICourse subtasks. Trajectory-level failures group by traceback tail in `errors_summary` so a recurrent bug surfaces immediately instead of being buried per-step.
 
 </details>
 
@@ -647,9 +961,9 @@ from qwen_vl_utils import process_vision_info
 
 # Default: Load the model on the available device(s)
 model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "HongxinLi/UIPro_1stage", torch_dtype="auto", device_map="auto"
+    "HongxinLi/UIPro-7B_Stage1", torch_dtype="auto", device_map="auto"
 )
-processor = AutoProcessor.from_pretrained("HongxinLi/UIPro_1stage")
+processor = AutoProcessor.from_pretrained("HongxinLi/UIPro-7B_Stage1")
 
 messages = [
     {
@@ -754,6 +1068,18 @@ Now, first describe the action intent and then directly plan the next action."""
 > - These scripts perform **online action prediction** step-by-step (i.e., they will run model inference), so a GPU environment is recommended.
 > - Outputs are saved as JSON files under `utils/eval_utils/eval_results/`.
 
+#### 🤗 Evaluation Datasets on HuggingFace
+
+The test annotations loaded by the four evaluation scripts are released publicly:
+
+| Benchmark | Script | HuggingFace |
+| :--- | :--- | :--- |
+| AiTW | `eval_aitw.py` | [AITW_test](https://huggingface.co/datasets/HongxinLi/AITW_test) |
+| AndroidControl | `eval_androidcontrol.py` | [AndroidControl_test](https://huggingface.co/datasets/HongxinLi/AndroidControl_test) |
+| GUIAct | `eval_guiact.py` | [GUIAct](https://huggingface.co/datasets/HongxinLi/GUIAct) |
+| Mind2Web | `eval_mind2web.py` | [Mind2Web_test](https://huggingface.co/datasets/HongxinLi/Mind2Web_test) |
+
+
 <details>
 <summary><b>🤖 AiTW (Android in the Wild) — `utils/eval_utils/eval_aitw.py`</b></summary>
 <br>
@@ -776,7 +1102,7 @@ Now, first describe the action intent and then directly plan the next action."""
 
 ```bash
 python utils/eval_utils/eval_aitw.py \
-  --pretrained "HongxinLi/UIPro_2stage_Mobile" \
+  --pretrained "HongxinLi/UIPro-7B_Stage2_Mobile" \
   --imgs_dir "/path/to/AITW/aitw_images" \
   --action_refexp \
   --scale 1000
@@ -808,7 +1134,7 @@ We also provide a preprocessed zip file of the AndroidControl test data used in 
 **Run**
 ```bash
 python utils/eval_utils/eval_androidcontrol.py \
-  --pretrained "HongxinLi/UIPro_2stage_Mobile" \
+  --pretrained "HongxinLi/UIPro-7B_Stage2_Mobile" \
   --testset_path "utils/eval_utils/AndroidControl-test_12685.json" \
   --data_root "/path/to/AndroidControl"
 ```

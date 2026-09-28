@@ -31,15 +31,16 @@ Usage:
     $ python 141_make_webui_data.py
 """
 
+import copy
 import gzip
 import glob
 import json
+import multiprocessing as mp
 import os
 import random
-import shutil
 import traceback
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any, Set, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -47,6 +48,8 @@ from tqdm import tqdm
 
 # Sibling imports (assuming the environment is set up with correct PYTHONPATH)
 from utils.data_utils.task_prompt_lib import (
+    WITHBOX_TAG,
+    WITHPOINT_TAG,
     make_icongnd_sample,
     make_iconref_sample,
     make_elemgnd_sample,
@@ -77,13 +80,19 @@ from utils.data_utils.misc import (
     is_valid_string,
     contain_network_errors,
 )
+from utils.data_utils.run_info import (
+    print_error_summary,
+    renumber_sample_ids,
+    save_run_info,
+    summarize_errors,
+)
 
 # =============================================================================
 # Configuration & Constants
 # =============================================================================
 
 DATASET_NAME = 'WebUI'
-DEBUG = True       # If True, processes only a small subset of data for testing.
+DEBUG = False       # If True, processes only a small subset of data for testing.
 DRAW = False        # If True, draws bounding boxes on images for visual verification.
 
 # --- Task Switches ---
@@ -105,7 +114,15 @@ SKIP_CHECKING = False      # If True, bypasses rigorous element validation (use 
 # --- Hyperparameters ---
 PROB_BOX = 0.3      # Probability of using a bounding box input instead of a point
 SCALE = 1000        # Normalization scale for coordinates (0-1000)
-LONGEST = 1344      # Target longer side length for image resizing
+LONGEST = -1      # Target longer side length for image resizing. LONGEST = 1344 is a proper choice. LONGEST = -1 means no resizing.
+
+# --- Parallelism ---
+# Number of worker processes. Set to 1 (or use DRAW=True) to force the
+# sequential code path, which is required when visually debugging.
+NUM_WORKERS = max(1, (os.cpu_count() or 1) - 1)
+# How often the cumulative `invalid_elem_record.json` is checkpointed to disk
+# (counted in completed sample-directories). Trades durability against I/O.
+CHECKPOINT_EVERY = 10000
 
 # --- Device Specifics ---
 # Ratios used to split long web screenshots into mobile-sized chunks.
@@ -131,9 +148,9 @@ ICON_ROLES = [
 ]
 
 # --- Paths ---
-WEBUI_DIR = f"/mnt/vdb1/hongxin_li/{DATASET_NAME}/dh2"
-WEBUI_PROCESSED_IMG_DIR = f"/mnt/vdb1/hongxin_li/{DATASET_NAME}/WebUI_screenshots"
-ROOT = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp"
+WEBUI_DIR = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}/dh2"
+WEBUI_PROCESSED_IMG_DIR = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}/WebUI_screenshots"
+ROOT = "/volume/pt-coder/users/gji/projects/UIPro/data"
 SAVE_ROOT = os.path.join(ROOT, f"{DATASET_NAME}_processed")
 
 # Ensure output directories exist
@@ -183,7 +200,7 @@ def _load_invalid_elems_record() -> Dict[str, Set[str]]:
 def _save_invalid_elems_record(invalid_elems: Dict[str, Set[str]]) -> None:
     """
     Saves the record of invalid elements to disk.
-    
+
     Args:
         invalid_elems: The dictionary of invalid elements to save.
     """
@@ -191,6 +208,34 @@ def _save_invalid_elems_record(invalid_elems: Dict[str, Set[str]]) -> None:
     with open(record_file, 'w') as f:
         # Convert sets to lists for JSON serialization
         json.dump({k: list(v) for k, v in invalid_elems.items()}, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Cumulative-stats persistence
+# ---------------------------------------------------------------------------
+# `invalid_elem_record.json` is already cumulative (set semantics dedupe across
+# runs). To make the reported ratios coherent we keep matching cumulative
+# tallies for iterated / processed / valid in a sibling JSON file. Delete
+# `cumulative_stats.json` to reset.
+_CUMULATIVE_STATS_FILE = os.path.join(SAVE_ROOT, 'cumulative_stats.json')
+_CUMULATIVE_KEYS = ('iterated_elem_cnt', 'processed_img_cnt', 'valid_img_cnt')
+
+
+def _load_cumulative_stats() -> Dict[str, int]:
+    """Load cumulative iteration tallies from disk (defaults to all-zero)."""
+    if os.path.exists(_CUMULATIVE_STATS_FILE):
+        try:
+            data = json.load(open(_CUMULATIVE_STATS_FILE))
+            return {k: int(data.get(k, 0)) for k in _CUMULATIVE_KEYS}
+        except Exception:
+            pass
+    return {k: 0 for k in _CUMULATIVE_KEYS}
+
+
+def _save_cumulative_stats(stats: Dict[str, int]) -> None:
+    """Persist cumulative iteration tallies to disk."""
+    with open(_CUMULATIVE_STATS_FILE, 'w') as f:
+        json.dump({k: int(stats.get(k, 0)) for k in _CUMULATIVE_KEYS}, f, indent=2)
 
 
 def _process_axtree_and_image(
@@ -552,7 +597,12 @@ def _create_samples_from_block(
         box_str = f'({normalized_box[0]},{normalized_box[1]},{normalized_box[2]},{normalized_box[3]})'
         all_node_box_strs.append(box_str)
 
-        loc = box_str if with_box else f'({normalized_center[0]},{normalized_center[1]})'
+        if with_box:
+            output_tag = WITHBOX_TAG
+            loc = box_str
+        else:
+            output_tag = WITHPOINT_TAG
+            loc = f'({normalized_center[0]},{normalized_center[1]})'
         
         # Uniqueness Check: Ambiguous prompts confuse models.
         # If two buttons are named "Save", we skip grounding tasks for them.
@@ -576,7 +626,7 @@ def _create_samples_from_block(
                         task_id=f'autogui_webui_icongnd_{counters["icongnd_cnt"]}',
                         icon_desc=node_name,
                         loc=loc,
-                        with_box=with_box
+                        output_tag=output_tag
                     )
                     sample.update({
                         'unnormalized_box': node['box'],
@@ -593,7 +643,7 @@ def _create_samples_from_block(
                         task_id=f'autogui_webui_iconref_{counters["iconref_cnt"]}',
                         icon_desc=node_name,
                         loc=loc,
-                        with_box=with_box
+                        output_tag=output_tag
                     )
                     sample.update({
                         'unnormalized_box': node['box'],
@@ -624,7 +674,7 @@ def _create_samples_from_block(
                             task_id=f'autogui_webui_elemgnd_{counters["elemgnd_cnt"]}',
                             elem_desc=node_name,
                             loc=loc,
-                            with_box=with_box
+                            output_tag=output_tag
                         )
 
                     sample.update({
@@ -642,7 +692,7 @@ def _create_samples_from_block(
                         task_id=f'autogui_webui_elemref_{counters["elemref_cnt"]}',
                         elem_desc=node_name,
                         loc=loc,
-                        with_box=with_box
+                        output_tag=output_tag
                     )
                     sample.update({
                         'unnormalized_box': node['box'],
@@ -652,7 +702,7 @@ def _create_samples_from_block(
                     })
                     samples.append(sample)
                     counters["elemref_cnt"] += 1
-            
+
             # --- Task: Intent Grounding (User Intent -> Loc) ---
             # Synthetic Intent: "I want to [click] the [Save] [button]"
             if INTENTGND and is_unique:
@@ -661,7 +711,7 @@ def _create_samples_from_block(
                     task_id=f'autogui_webui_intentgnd_{counters["intentgnd_cnt"]}',
                     intent=intent,
                     loc=loc,
-                    with_box=with_box
+                    output_tag=output_tag
                 )
                 sample.update({
                     'unnormalized_box': node['box'],
@@ -679,7 +729,7 @@ def _create_samples_from_block(
                 task_id='autogui_webui_elemclass_',  # Suffix will be added after rebalancing
                 elem_cls=node_role,
                 loc=loc,
-                with_box=with_box
+                output_tag=output_tag
             )
             sample.update({
                 'unnormalized_box': node['box'],
@@ -722,6 +772,149 @@ def _create_samples_from_block(
         counters["widgetlist_cnt"] += 1
 
 
+# ---------------------------------------------------------------------------
+# Parallel-processing worker
+# ---------------------------------------------------------------------------
+# All buckets that _validate_block_nodes may write to. Workers seed a fresh
+# defaultdict-like structure so missing buckets don't crash; main aggregates.
+_INVALID_BUCKETS: Tuple[str, ...] = (
+    INVALID_TEXT_LANGUAGE,
+    TOO_SMALL_ELEMENT,
+    INVALID_ELEM_BOX,
+    INVALID_ELEM_CONTENT,
+    BLANK_ELEM,
+    EMPTY_ELEM_TEXT,
+    OVERLY_LENGTHY_ELEM_TEXT,
+    DUPLICATE_ELEMEMNT,
+    INCORRECT_TEXT_ANNO,
+    OVERSIZED_ELEMENT,
+    EXTREME_ASPECT_RATIO,
+)
+
+def _process_one_sample_dir(sample_dir: str) -> Dict[str, Any]:
+    """Worker: process every axtree under ``sample_dir`` and return deltas.
+
+    The function is intentionally side-effect-free with respect to the parent
+    process — all mutation happens against local containers and only the
+    aggregated deltas are returned. This keeps the ``multiprocessing.Pool``
+    contract simple and dead-lock free (no shared state, no locks, no nested
+    pools).
+
+    Returned dict keys:
+      - ``samples``: list of generated samples (with worker-local task IDs).
+      - ``elemclass_stats``: ``{role: [class samples]}`` to be merged into the
+        global rebalance pool.
+      - ``counters``: per-task local counts.
+      - ``invalid_updates``: ``{bucket: [sample_id, ...]}`` to union into the
+        cumulative invalid-elem record.
+      - ``unique_elem_entries``: per-image box lists (image keys are unique
+        across dirs, so the parent merges with a plain ``dict.update``).
+      - ``iterated_elem_cnt`` / ``processed_img_cnt`` / ``valid_img_cnt``:
+        per-dir tallies.
+      - ``errors``: ``[[axtree_path, traceback_str], ...]``
+    """
+    samples: List[Dict] = []
+    elemclass_stats: Dict[str, List[Dict]] = defaultdict(list)
+    counters: Dict[str, int] = defaultdict(int)
+    invalid_updates: Dict[str, Set[str]] = {b: set() for b in _INVALID_BUCKETS}
+    unique_elems_local: Dict[str, List[List[int]]] = {}
+    errors: List[List[str]] = []
+    iterated_elem_cnt = 0
+    processed_img_cnt = 0
+    valid_img_cnt = 0
+
+    axtree_paths = glob.glob(os.path.join(WEBUI_DIR, sample_dir, '*axtree.json.gz'))
+    for axtree_path in axtree_paths:
+        try:
+            axtree_nodes, img, bboxes, device_type = _process_axtree_and_image(
+                axtree_path, unique_elems_local
+            )
+            if axtree_nodes is None:
+                continue
+
+            processed_img_cnt += 1
+
+            block_idx_with_most_icons, num_icons_each_block = _split_image_into_blocks(
+                img, axtree_nodes, bboxes, device_type, axtree_path
+            )
+            if (
+                block_idx_with_most_icons == -1
+                or num_icons_each_block[block_idx_with_most_icons]['num_icons'] == 0
+            ):
+                continue
+
+            _, W = img.shape[:2]
+            ratio = 2532 / 1170 if 'iPhone' in axtree_path else 720 / 1280
+            block_h = int(W * ratio)
+            h_start = block_h * block_idx_with_most_icons
+
+            cropped_img = img[h_start:h_start + block_h]
+            screenshot, resizing_ratio = resize_image(cropped_img, max_size=LONGEST)
+            sc_h, sc_w = screenshot.shape[:2]
+
+            traj_dir = os.path.join(WEBUI_PROCESSED_IMG_DIR, sample_dir)
+            os.makedirs(traj_dir, exist_ok=True)
+            screenshot_file = os.path.join(traj_dir, f"{device_type}.png")
+            short_screenshot_name = (
+                f"{DATASET_NAME}/WebUI_screenshots/{sample_dir}/{device_type}.png"
+            )
+            if not os.path.exists(screenshot_file):
+                cv2.imwrite(screenshot_file, screenshot)
+
+            block_nodes_raw = num_icons_each_block[block_idx_with_most_icons]['nodes']
+            valid_node_entries = _validate_block_nodes(
+                block_nodes=block_nodes_raw,
+                axtree_path=axtree_path,
+                invalid_elems=invalid_updates,
+                img_file=axtree_path.replace(
+                    'axtree.json.gz', 'screenshot-full.webp'
+                ),
+                unique_elems=unique_elems_local,
+                resizing_ratio=resizing_ratio,
+                h_start=h_start,
+                sc_w=sc_w,
+                sc_h=sc_h,
+                screenshot=screenshot,
+            )
+            iterated_elem_cnt += len(block_nodes_raw)
+            if not valid_node_entries:
+                continue
+
+            valid_nodes = [entry[0] for entry in valid_node_entries]
+            samples_before = len(samples)
+            elemclass_before = sum(len(v) for v in elemclass_stats.values())
+            _create_samples_from_block(
+                valid_nodes=valid_nodes,
+                sc_w=sc_w,
+                sc_h=sc_h,
+                short_screenshot_name=short_screenshot_name,
+                counters=counters,
+                elemclass_stats=elemclass_stats,
+                samples=samples,
+            )
+            produced = (
+                len(samples) > samples_before
+                or sum(len(v) for v in elemclass_stats.values()) > elemclass_before
+            )
+            if produced:
+                valid_img_cnt += 1
+
+        except Exception:
+            errors.append([axtree_path, traceback.format_exc()])
+
+    return {
+        'samples': samples,
+        'elemclass_stats': dict(elemclass_stats),
+        'counters': dict(counters),
+        'invalid_updates': {k: list(v) for k, v in invalid_updates.items() if v},
+        'unique_elem_entries': unique_elems_local,
+        'iterated_elem_cnt': iterated_elem_cnt,
+        'processed_img_cnt': processed_img_cnt,
+        'valid_img_cnt': valid_img_cnt,
+        'errors': errors,
+    }
+
+
 def make_webui_data():
     """
     Main driver function to process the WebUI dataset.
@@ -738,8 +931,11 @@ def make_webui_data():
     counters = defaultdict(int)
     elemclass_stats = defaultdict(list)
     
-    # Load persistent record of invalid elements to avoid re-processing known bad data
+    # Load persistent records. Both `invalid_elem_record.json` (set-based) and
+    # `cumulative_stats.json` (count-based) accumulate across runs so the
+    # reported ratios stay coherent across the dataset's lifetime.
     invalid_elems = _load_invalid_elems_record()
+    cumulative_stats = _load_cumulative_stats()
     
     sample_dirs = sorted(os.listdir(WEBUI_DIR))
     if DEBUG:
@@ -754,95 +950,76 @@ def make_webui_data():
     valid_img_cnt = 0
     iterated_elem_cnt = 0
 
-    print(f"Processing {len(sample_dirs)} directories...")
-    
-    for sample_idx, sample_dir in tqdm(enumerate(sample_dirs), total=len(sample_dirs)):
-        # Each directory might contain multiple axtree files
-        axtree_paths = glob.glob(os.path.join(WEBUI_DIR, sample_dir, '*axtree.json.gz'))
-        
-        for axtree_path in axtree_paths:
-            try:
-                # Step 1: Load raw data
-                axtree_nodes, img, bboxes, device_type = _process_axtree_and_image(axtree_path, unique_elems)
-                if axtree_nodes is None:
-                    continue
-                
-                processed_img_cnt += 1
+    # ------------------------------------------------------------------
+    # Streaming aggregator: pulled by both the sequential and parallel
+    # branches below so the bookkeeping logic lives in exactly one place.
+    # Returns True when this result yielded any output (used only for the
+    # `valid_img_cnt` running tally — kept here as a closure to avoid
+    # leaking the many locals it touches).
+    # ------------------------------------------------------------------
+    def _aggregate(result: Dict[str, Any]) -> None:
+        nonlocal iterated_elem_cnt, processed_img_cnt, valid_img_cnt
+        samples.extend(result['samples'])
+        for role, eclass in result['elemclass_stats'].items():
+            elemclass_stats[role].extend(eclass)
+        for k, v in result['counters'].items():
+            counters[k] += v
+        for bucket, ids in result['invalid_updates'].items():
+            invalid_elems.setdefault(bucket, set()).update(ids)
+        # Image keys are unique per sample_dir, so `update` is safe and O(1)/entry.
+        unique_elems.update(result['unique_elem_entries'])
+        errors.extend(result['errors'])
+        iterated_elem_cnt += result['iterated_elem_cnt']
+        processed_img_cnt += result['processed_img_cnt']
+        valid_img_cnt += result['valid_img_cnt']
 
-                # Step 2: Intelligent Splitting
-                block_idx_with_most_icons, num_icons_each_block = _split_image_into_blocks(
-                    img, axtree_nodes, bboxes, device_type, axtree_path
-                )
-                
-                # Skip if no suitable block found or block is empty of icons
-                if block_idx_with_most_icons == -1 or num_icons_each_block[block_idx_with_most_icons]['num_icons'] == 0:
-                    continue
+    # DRAW mutates pixels of a shared image for human inspection and is only
+    # used during debugging; force sequential to keep its side effects visible.
+    use_parallel = NUM_WORKERS > 1 and not DRAW
+    print(
+        f"Processing {len(sample_dirs)} directories "
+        f"{'in parallel across ' + str(NUM_WORKERS) + ' workers' if use_parallel else 'sequentially'}..."
+    )
 
-                # Step 3: Crop Image
-                H, W = img.shape[:2]
-                # Calculate block height
-                ratio = 2532 / 1170 if 'iPhone' in axtree_path else 720/1280
-                block_h = int(W * ratio)
-                h_start = block_h * block_idx_with_most_icons
-                
-                cropped_img = img[h_start:h_start + block_h]
-                # Resize to standard training resolution (LONGEST side)
-                screenshot, resizing_ratio = resize_image(cropped_img, max_size=LONGEST)
-                sc_h, sc_w = screenshot.shape[:2]
-                
-                # Save the processed image for the dataset
-                traj_dir = os.path.join(WEBUI_PROCESSED_IMG_DIR, sample_dir)
-                os.makedirs(traj_dir, exist_ok=True)
-                screenshot_file = os.path.join(traj_dir, f"{device_type}.png")
-                # Store relative path for JSON
-                short_screenshot_name = f"{DATASET_NAME}/{sample_dir}/{device_type}.png"
-                
-                if not os.path.exists(screenshot_file):
-                    cv2.imwrite(screenshot_file, screenshot)
+    if use_parallel:
+        # chunksize ~ N / (workers * 4): big enough to amortize IPC, small
+        # enough that imap_unordered keeps progress flowing per result.
+        # We don't use a manual queue or Manager — imap_unordered drains
+        # results as they're produced, so the only ways to deadlock would be
+        # nesting another pool inside the worker or letting an exception
+        # bubble inside the worker (we catch and return them instead).
+        chunksize = max(1, min(64, len(sample_dirs) // max(1, NUM_WORKERS * 4)))
+        completed = 0
+        with mp.Pool(processes=NUM_WORKERS) as pool:
+            pbar = tqdm(
+                pool.imap_unordered(
+                    _process_one_sample_dir, sample_dirs, chunksize=chunksize
+                ),
+                total=len(sample_dirs),
+                desc=f"WebUI ×{NUM_WORKERS}",
+                smoothing=0.05,
+            )
+            for result in pbar:
+                _aggregate(result)
+                completed += 1
+                if completed % CHECKPOINT_EVERY == 0:
+                    _save_invalid_elems_record(invalid_elems)
+    else:
+        for sample_dir in tqdm(sample_dirs, total=len(sample_dirs), desc="WebUI"):
+            _aggregate(_process_one_sample_dir(sample_dir))
 
-                # Step 4: Validate Nodes
-                block_nodes_raw = num_icons_each_block[block_idx_with_most_icons]['nodes']
-                
-                valid_node_entries = _validate_block_nodes(
-                    block_nodes=block_nodes_raw,
-                    axtree_path=axtree_path,
-                    invalid_elems=invalid_elems,
-                    img_file=axtree_path.replace('axtree.json.gz', 'screenshot-full.webp'), # Key for unique_elems
-                    unique_elems=unique_elems,
-                    resizing_ratio=resizing_ratio,
-                    h_start=h_start,
-                    sc_w=sc_w,
-                    sc_h=sc_h,
-                    screenshot=screenshot
-                )
-                
-                iterated_elem_cnt += len(block_nodes_raw)
-                
-                if not valid_node_entries:
-                    continue
+    # Final flush of the cumulative invalid-element record.
+    _save_invalid_elems_record(invalid_elems)
 
-                valid_nodes = [entry[0] for entry in valid_node_entries]
-                
-                # Step 5: Generate Samples
-                _create_samples_from_block(
-                    valid_nodes=valid_nodes,
-                    sc_w=sc_w,
-                    sc_h=sc_h,
-                    short_screenshot_name=short_screenshot_name,
-                    counters=counters,
-                    elemclass_stats=elemclass_stats,
-                    samples=samples
-                )
+    # Surface mass-failures loudly: a regression that breaks every worker call
+    # (e.g., an UnboundLocalError in `_create_samples_from_block`) otherwise
+    # only manifests as a smaller sample count buried in info.json.
+    print_error_summary(errors, total_tasks=len(sample_dirs))
 
-                valid_img_cnt += 1
-
-            except Exception:
-                # Capture stack trace but continue processing other files
-                errors.append([axtree_path, traceback.format_exc()])
-
-        # Periodic Checkpoint: Save invalid element records
-        if sample_idx % 10000 == 0 or sample_idx == len(sample_dirs) - 1:
-            _save_invalid_elems_record(invalid_elems)
+    # After aggregation, each worker's per-task local counters started at 0,
+    # so sample IDs collide globally. Renumber by extracting the `<prefix>`
+    # from each id and re-striping the trailing integer.
+    renumber_sample_ids(samples)
 
     # Step 6: Post-Processing - Class Rebalancing
     # Some UI elements (like 'links') are extremely common, while others ('sliders') are rare.
@@ -857,23 +1034,25 @@ def make_webui_data():
             new_elemcls_samples = []
             stats_after_rebal = defaultdict(int)
             
-            for elemcls, samples_eachcls in elemclass_stats.items():
+            for samples_eachcls in elemclass_stats.values():
                 if not samples_eachcls: continue
                 
                 if len(samples_eachcls) > num_sample_each_cls:
                     # Downsample
-                    new_elemcls_samples.extend(random.sample(samples_eachcls, num_sample_each_cls))
+                    chosen = random.sample(samples_eachcls, num_sample_each_cls)
                 else:
                     # Upsample (Repeat + Random remainder)
                     multiplier = int(num_sample_each_cls // len(samples_eachcls))
                     remainder = num_sample_each_cls % len(samples_eachcls)
-                    
-                    extended_samples = samples_eachcls * multiplier + random.sample(samples_eachcls, remainder)
-                    new_elemcls_samples.extend(extended_samples)
-            
+                    chosen = samples_eachcls * multiplier + random.sample(samples_eachcls, remainder)
+
+                # Deep-copy so repeated references become independent dicts —
+                # otherwise mutating `id` below would alias across duplicates.
+                new_elemcls_samples.extend(copy.deepcopy(s) for s in chosen)
+
             # Add unique IDs to generated samples
             for i, sample in enumerate(new_elemcls_samples):
-                sample['id'] += str(i)
+                sample['id'] = f'autogui_webui_elemclass_{i}'
                 stats_after_rebal[sample['conversations'][1]['value']] += 1
             
             counters['elemclass_cnt'] = len(new_elemcls_samples)
@@ -884,59 +1063,73 @@ def make_webui_data():
         stats_after_rebal = {}
 
     # Step 7: Reporting & Saving
+    # Roll this run's tallies into the cumulative-across-runs counters so the
+    # reported ratios line up with the cumulative `invalid_elems` record.
+    cumulative_stats['iterated_elem_cnt'] += iterated_elem_cnt
+    cumulative_stats['processed_img_cnt'] += processed_img_cnt
+    cumulative_stats['valid_img_cnt'] += valid_img_cnt
+    _save_cumulative_stats(cumulative_stats)
+
     num_invalid_elem = sum(len(v) for v in invalid_elems.values())
     num_unique_elems = sum(len(v) for v in unique_elems.values())
-    num_valid_imgs = len([k for k, v in unique_elems.items() if len(v)])
 
-    report = (
-        f"========================================\n"
-        f"Processing Report:\n"
-        f"#Samples Generated: {len(samples)}\n"
-        f"#Unique Elements: {num_unique_elems}\n"
-        f"#Valid Unique Images: {num_valid_imgs}\n"
-        f"#All Unique Images Scanned: {len(unique_elems)}\n"
-        f"Invalid Element Ratio: {num_invalid_elem} / {iterated_elem_cnt} = "
-        f"{(num_invalid_elem / iterated_elem_cnt if iterated_elem_cnt > 0 else 0.0):.2f}\n"
-        f"----------------------------------------\n"
-        f"Task Counters:\n"
-        f"  TextLoc   : {counters['text_loc_cnt']}\n"
-        f"  OCR       : {counters['ocr_cnt']}\n"
-        f"  IconGnd   : {counters['icongnd_cnt']}\n"
-        f"  IconRef   : {counters['iconref_cnt']}\n"
-        f"  ElemGnd   : {counters['elemgnd_cnt']}\n"
-        f"  ElemRef   : {counters['elemref_cnt']}\n"
-        f"  ElemClass : {counters['elemclass_cnt']}\n"
-        f"  IntentGnd : {counters['intentgnd_cnt']}\n"
-        f"  WidgetList: {counters['widgetlist_cnt']}\n"
-        f"========================================"
-    )
-    print(report)
-    
     save_file = os.path.join(SAVE_ROOT, f"{DATASET_NAME}_scale{SCALE}_{len(samples)//1000}k{'_actformat' if USE_ACTION_PROMPT else ''}.json")
 
-    # Save Detailed Info JSON
-    info_data = {
-        'num_samples': len(samples),
-        '#valid_unique_images': num_valid_imgs,
-        '#all_unique_images': len(unique_elems),
-        '#num_unique_elems': num_unique_elems,
-        '#invalid_elems': num_invalid_elem,
-        '#all_elems': iterated_elem_cnt,
-        '#invalid_elem_ratio': num_invalid_elem / iterated_elem_cnt if iterated_elem_cnt else 0,
-        'counters': dict(counters),
-        'report': report,
-        'elem_class_stats_before_rebalance': {k: len(v) for k, v in elemclass_stats.items()},
-        'num_sample_each_elem_class_after_rebalance': stats_after_rebal,
-        'errors': errors
-    }
-    
-    with open(save_file.replace('.json', '_info.json'), "w") as f:
-        json.dump(info_data, f, indent=2)
-    
-    # Save Small Sample for Debugging
-    if samples:
-        with open(save_file.replace('.json', '_sample.json'), "w") as f:
-            json.dump(random.sample(samples, min(160, len(samples))), f, indent=2)
+    save_run_info(
+        dataset=DATASET_NAME,
+        output_path=save_file,
+        samples=samples,
+        counters=counters,
+        config={
+            'debug': DEBUG,
+            'scale': SCALE,
+            'prob_box': PROB_BOX,
+            'longest': LONGEST,
+            'use_action_prompt': USE_ACTION_PROMPT,
+            'skip_checking': SKIP_CHECKING,
+        },
+        images={
+            # Cumulative aggregated counts (invalid_elem_record.json is also
+            # cumulative). Per-run figures are kept in `extra_sections.run_stats`.
+            'processed': cumulative_stats['processed_img_cnt'],
+            'valid': cumulative_stats['valid_img_cnt'],
+        },
+        elements={
+            'iterated': cumulative_stats['iterated_elem_cnt'],
+            'invalid': num_invalid_elem,
+            'unique': num_unique_elems,
+            'invalid_breakdown': {k: len(v) for k, v in invalid_elems.items()},
+        },
+        tasks_enabled={
+            'TextLoc': TEXTLOC,
+            'OCR': OCR,
+            'IconGnd': ICONGND,
+            'IconRef': ICONREF,
+            'ElemGnd': ELEMGND,
+            'ElemRef': ELEMREF,
+            'ElemClass': ELEMCLASS,
+            'IntentGnd': INTENTGND,
+            'WidgetList': WIDGETLIST,
+        },
+        extra_sections={
+            'run_stats': {
+                'iterated_elem_cnt': iterated_elem_cnt,
+                'processed_img_cnt': processed_img_cnt,
+                'valid_img_cnt': valid_img_cnt,
+                'unique_imgs_seen_this_run': len(unique_elems),
+            },
+            'elem_class_stats_before_rebalance': {
+                k: len(v) for k, v in elemclass_stats.items()
+            },
+            'num_sample_each_elem_class_after_rebalance': stats_after_rebal,
+            # Keep info.json compact even when mass-failure occurs: group
+            # tracebacks by their last line and store up to 5 example paths
+            # per group.
+            'errors_summary': summarize_errors(errors),
+            'errors_total': len(errors),
+        },
+        preview_size=160,
+    )
 
     # Save Full Dataset
     print(f"Saving full dataset to {save_file}...")

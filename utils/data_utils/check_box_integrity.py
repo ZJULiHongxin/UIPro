@@ -10,15 +10,15 @@ SCALE = 1000
 pattern = r'\(\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*,\s*-?\d+\.\d+\s*\]'
 
 
-data = json.load(open("/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/mobileviews_processed/mobileviews_TextLoc_OCR_IntentGnd_WidgetList_scale1000_6k_debug.json"))
-data_dir = ["/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/"][-1]
+data = json.load(open("/volume/pt-coder/users/gji/projects/UIPro/data/WAE_processed/WAE_scale1000_4k_debug_sample.json"))
+data_dir = ["data"][-1]
 
 if RANDOM: random.shuffle(data)
 
 for idx, x in enumerate(data):
     
     
-    #if 'planning'  in x['id']: continue
+    # if 'widget' not in x['id']: continue
     #if 'funcpred' in x['image']:
     # if W > H: img = cv2.resize(img, dsize=(W//2, H//2))
     # else: img = cv2.resize(img, dsize=(W//3, H//3))
@@ -174,9 +174,10 @@ for idx, x in enumerate(data):
                         cv2.circle(img, center=(center_x,center_y) , radius=2,  color=color, thickness=-1)
             else: # '{"bbox_2d": [960, 382, 1009, 396]}'
                 coords = extract_integers(gpt)
+
                 if len(coords) % 2 != 0:
                     coords = coords[1:]
-                if coords[0] == coords[2] and coords[1] == coords[3]:
+                if len(coords) == 4 and coords[0] == coords[2] and coords[1] == coords[3]:
                     coords = coords[:2]
                 
                 if len(coords):

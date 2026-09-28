@@ -3,13 +3,14 @@ from tqdm import tqdm
 
 from utils.data_utils.task_prompt_lib import *
 from utils.data_utils.misc import is_pure_color
+from utils.data_utils.run_info import save_run_info
 
 SCALE = 1000
-IMG_DIR = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/images/rico/"
-ANNO_FILE = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/raw/ricosca.json"
+IMG_DIR = "/volume/pt-coder/users/gji/projects/UIPro/data/rico/"
+ANNO_FILE = "/volume/pt-coder/users/gji/projects/UIPro/data/ricosca.json"
 
 DATASET_NAME = 'RICOSCA'
-SAVE_ROOT = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/{DATASET_NAME}_processed"
+SAVE_ROOT = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}_processed"
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
 USE_ACTION_PROMPT = False
@@ -107,17 +108,33 @@ def make_widcap_data():
     num_unique_elems = sum(len(v) for v in unique_elems.values())
     num_valid_imgs = len([k for k,v in unique_elems.items() if len(v)])
 
-    report = f"#samples: {len(samples)}\n#Unique elements: {num_unique_elems}\n#Valid unique images: {num_valid_imgs}\n#All unique images: {len(unique_elems)}\nInvalid elem ratio: {num_invalid_elem} / {len(data)} = {num_invalid_elem/len(data):.2f}\nintentgnd_cnt: {len(samples)} | ocr_cnt: 0 | widgetlist_cnt: 0"
-    print(report)
-
     file_name = os.path.join(SAVE_ROOT, f"{DATASET_NAME}_{len(samples)// 1000}k{'_debug' if DEBUG else ''}{'_actformat' if USE_ACTION_PROMPT else ''}.json")
     print(f"save to {file_name}")
-    with open(file_name.replace('.json', '_info.json'), "w") as f:
-        json.dump({'num_samples': len(samples), '#num_unique_elems': num_unique_elems, '#all_elems': len(data), '#valid_unique_images': num_valid_imgs, '#all_unique_images': len(unique_elems), 'ocr_cnt': 0, 'elemclass_cnt': 0, 'intentgnd_cnt': len(samples), 'widgetlist_cnt': 0, 'num_invalid_elements': num_invalid_elem, 'invalid_elem_types': {k:len(v) for k,v in invalid_elem.items()}}, f, indent=2)
 
-    with open(file_name.replace(".json","_sample.json"), 'w') as f:
-        json.dump(random.sample(samples,min(len(samples), 128)), f, indent=2)
-        
+    save_run_info(
+        dataset=DATASET_NAME,
+        output_path=file_name,
+        samples=samples,
+        counters={'intentgnd_cnt': len(samples)},
+        config={
+            'debug': DEBUG,
+            'scale': SCALE,
+            'use_action_prompt': USE_ACTION_PROMPT,
+            'skip_checking': SKIP_CHECKING,
+        },
+        images={
+            'processed': len(unique_elems),
+            'valid': num_valid_imgs,
+        },
+        elements={
+            'iterated': len(data),
+            'invalid': num_invalid_elem,
+            'unique': num_unique_elems,
+            'invalid_breakdown': {k: len(v) for k, v in invalid_elem.items()},
+        },
+        tasks_enabled={'IntentGnd': True},
+    )
+
     with open(file_name, 'w') as f:
         json.dump(samples, f, indent=2)
 

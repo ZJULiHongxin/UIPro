@@ -18,12 +18,14 @@ import ast
 import cv2
 import glob
 import json
+import multiprocessing as mp
 import os
 import random
 import re
+import traceback
 from collections import defaultdict
 from io import BytesIO
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Set, Union
 
 import numpy as np
 import pandas as pd
@@ -34,10 +36,16 @@ from tqdm import tqdm
 
 from utils.data_utils.task_prompt_lib import *
 from utils.data_utils.misc import (
-    is_pure_color, 
-    is_valid_string, 
-    decode_img_base64, 
+    is_pure_color,
+    is_valid_string,
+    decode_img_base64,
     keep_unique_actions
+)
+from utils.data_utils.run_info import (
+    print_error_summary,
+    renumber_sample_ids,
+    save_run_info,
+    summarize_errors,
 )
 
 # =============================================================================
@@ -65,8 +73,8 @@ class DatasetConfig:
     CURRENT_DEVICE_TYPE = DEVICE_TYPES[1]  # 'smartphone'
     
     # Path configurations
-    DATA_ROOT = "/mnt/vdb1/hongxin_li/GUICourse"
-    SAVE_DIR = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/{DATASET_NAME}_processed"
+    DATA_ROOT = "/volume/pt-coder/users/gji/projects/UIPro/data/GUICourse"
+    SAVE_DIR = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}_processed"
     
     # Processing flags
     DEBUG_MODE = True
@@ -91,6 +99,55 @@ class DatasetConfig:
     # Validation thresholds
     MIN_ELEMENT_SIZE_RATIO = 0.005  # Minimum element size relative to image dimensions
     MIN_OCR_SIMILARITY_THRESHOLD = 22  # Minimum similarity for OCR validation
+
+    # Skip the per-sample tesseract OCR-similarity check (the single most
+    # expensive validation step — one subprocess per sample). Recommended
+    # for trusted upstream sources where you don't need to second-guess
+    # the annotation text. Has nothing to do with whether the OCR *task*
+    # samples are generated; only disables the *validation* of textloc
+    # annotations against tesseract output.
+    SKIP_OCR_VALIDATION = False
+
+    # Parallelism: 1 forces the sequential code path.
+    #
+    # NUM_WORKERS is the default cap; it's clamped further per subtask
+    # because their workloads scale very differently:
+    #   - GUIEnv: subprocess-bound (pytesseract). Past ~16-32 workers the
+    #     system thrashes on subprocess spawns and tempfile churn. The cap
+    #     ``GUIENV_MAX_WORKERS`` enforces this even on big boxes.
+    #   - GUIChat: I/O-bound (cv2.imread). Scales reasonably to many workers.
+    #   - GUIAct: CPU-bound, no per-step subprocess. Scales linearly.
+    NUM_WORKERS = max(1, (os.cpu_count() or 1) - 1)
+    GUIENV_MAX_WORKERS = 32   # subprocess-heavy; more than this just thrashes.
+    GUICHAT_MAX_WORKERS = 64  # I/O-heavy; some kernels saturate around here.
+    GUIACT_MAX_WORKERS = None  # CPU-bound; respect NUM_WORKERS as-is.
+
+    @classmethod
+    def workers_for(cls, subtask: str) -> int:
+        """Return the effective worker count for ``subtask`` after caps."""
+        cap = {
+            'GUIEnv': cls.GUIENV_MAX_WORKERS,
+            'GUIChat': cls.GUICHAT_MAX_WORKERS,
+            'GUIAct': cls.GUIACT_MAX_WORKERS,
+        }.get(subtask)
+        if cap is None:
+            return cls.NUM_WORKERS
+        return max(1, min(cls.NUM_WORKERS, cap))
+
+
+# ---------------------------------------------------------------------------
+# Per-worker globals populated by ``_init_worker`` for each subprocessor.
+# Each Pool initialiser installs the cumulative invalid-id skip-list as a
+# frozenset so per-sample ``in`` lookups are O(1) instead of scanning all
+# buckets every call.
+# ---------------------------------------------------------------------------
+_GUIENV_INVALID_IDS: frozenset = frozenset()
+
+
+def _guienv_init_worker(invalid_ids: frozenset) -> None:
+    """Pool initialiser for GUIEnv workers."""
+    global _GUIENV_INVALID_IDS
+    _GUIENV_INVALID_IDS = invalid_ids
 
 # Task mapping for different operation types
 TASK_TYPE_MAPPING = {
@@ -255,6 +312,332 @@ def discretize_distance(distance: float) -> str:
         return "long"
 
 # =============================================================================
+# MODULE-LEVEL PER-ITEM WORKERS (for multiprocessing.Pool)
+# =============================================================================
+# Workers must be at module level so they're picklable. They read read-only
+# state from module globals populated by the Pool initialiser, return small
+# delta dicts that the parent process merges into the per-subprocessor state.
+# All exceptions are caught locally so a poisonous item never hangs the pool.
+
+
+def _guienv_process_single_sample(
+    sample: Dict,
+    img_path: str,
+    img_cache: List[Optional[Any]],
+    used_instructions: List[str],
+    new_invalid: Dict[str, set],
+    counters: Dict[str, int],
+) -> Optional[Dict[str, Any]]:
+    """Stateless variant of ``GUIEnvProcessor._process_single_sample``.
+
+    ``img_cache`` is a single-element list used as a mutable cell: the first
+    sample in an image-group that actually needs pixel access triggers the
+    cv2.imread; subsequent samples in the same group reuse the cached array.
+    This is the difference between reading the same PNG 100 times and once
+    — material when there are 127 workers fighting the disk in parallel.
+    """
+    uid_parts = sample['uid'].split("_")
+    if len(uid_parts) < 6:
+        return None
+
+    task_type = TASK_TYPE_MAPPING.get(uid_parts[4])
+    if not task_type:
+        return None
+    if task_type == 'textloc' and not DatasetConfig.ENABLE_TEXTLOC:
+        return None
+    if task_type == 'ocr' and not DatasetConfig.ENABLE_OCR:
+        return None
+
+    counters['total_iterations'] += 1
+    sample_id = sample['uid']
+
+    # Cumulative skip-list lookup (O(1) against the worker-global frozenset).
+    if sample_id in _GUIENV_INVALID_IDS:
+        return None
+
+    # Extract task-specific instruction + box.
+    if task_type == 'textloc':
+        instruction = sample['question'].strip()
+        boxes = sample['answer']['absolute']
+        if len(boxes) != 1:
+            return None
+        box = list(map(int, boxes[0][5:-6].split(',')))
+        if not DatasetConfig.SKIP_VALIDATION and instruction in used_instructions:
+            new_invalid[INVALID_ELEMENT_CATEGORIES['DUPLICATE_ELEMENT']].add(sample_id)
+            return None
+        used_instructions.append(instruction)
+    else:  # ocr
+        instruction = sample['answer'].strip()
+        box = list(map(int, sample['question']['absolute'][5:-6].split(',')))
+
+    # Validation gate (inline-mirror of GUIEnvProcessor._validate_sample,
+    # but writing to the per-image-group ``new_invalid`` rather than self.*).
+    if not DatasetConfig.SKIP_VALIDATION:
+        if len(instruction) == 0:
+            new_invalid[INVALID_ELEMENT_CATEGORIES['EMPTY_ELEM_TEXT']].add(sample_id)
+            return None
+
+        image_size = (sample['image_size']['width'], sample['image_size']['height'])
+        if not validate_element_box(box, image_size):
+            new_invalid[INVALID_ELEMENT_CATEGORIES['INVALID_ELEM_BOX']].add(sample_id)
+            return None
+
+        # Read once per group — every sample after the first reuses ``img_cache``.
+        if img_cache[0] is None:
+            img_cache[0] = cv2.imread(img_path)
+        img = img_cache[0]
+        if img is None:
+            return None
+
+        if is_pure_color(img, box):
+            new_invalid[INVALID_ELEMENT_CATEGORIES['BLANK_ELEM']].add(sample_id)
+            return None
+
+        # Tesseract validation is the single most expensive step in this
+        # pipeline (subprocess per sample). Skip it via SKIP_OCR_VALIDATION
+        # when the source data is already trusted.
+        if not DatasetConfig.SKIP_OCR_VALIDATION:
+            if not validate_ocr_text(img, box, instruction):
+                new_invalid[INVALID_ELEMENT_CATEGORIES['INCORRECT_TEXT_ANNO']].add(sample_id)
+                return None
+
+    # Build the output sample. IDs are local-to-worker integers; the main
+    # process renumbers them globally per-prefix after aggregation.
+    width = sample['image_size']['width']
+    height = sample['image_size']['height']
+    x1, y1, x2, y2 = box
+    normalized_box = normalize_coordinates(box, (width, height))
+    center_x = round((x1 + x2) / 2 / width * DatasetConfig.SCALE)
+    center_y = round((y1 + y2) / 2 / height * DatasetConfig.SCALE)
+
+    if x1 != x2 and y1 != y2 and random.random() < DatasetConfig.BOUNDING_BOX_PROBABILITY:
+        location = '(' + ','.join(map(str, normalized_box)) + ')'
+        with_box = True
+    else:
+        location = f'({center_x},{center_y})'
+        with_box = False
+
+    short_img_path = img_path[img_path.find(DatasetConfig.DATASET_NAME):]
+    local_idx = counters['textloc_cnt'] if task_type == 'textloc' else counters['ocr_cnt']
+
+    if task_type == 'textloc':
+        if DatasetConfig.USE_ACTION_PROMPT:
+            action = CLICK_TEMPLATE.format(target_x=center_x, target_y=center_y)
+            processed = make_actionplanning_sample(
+                task_id=f'autogui_{DatasetConfig.DATASET_NAME}_textloc_{local_idx}',
+                global_task=instruction,
+                gt_action=action,
+                history='None',
+                prompt_format_type='aguvis',
+            )
+        else:
+            processed = make_textloc_sample(
+                task_id=f'autogui_GUIEnv_textloc_{local_idx}',
+                text=instruction,
+                loc=location,
+                output_tag=DatasetConfig.OUTPUT_TAG,
+                foramt=DatasetConfig.LOCATION_FORMAT,
+            )
+        counters['textloc_cnt'] += 1
+    else:  # ocr
+        processed = make_ocr_sample(
+            task_id=f'autogui_GUIEnv_ocr_{local_idx}',
+            text=instruction,
+            loc=location,
+            with_box=with_box,
+        )
+        counters['ocr_cnt'] += 1
+
+    processed.update({
+        'image': short_img_path,
+        'task_attr': instruction if task_type == 'textloc' else location,
+        'wxh': f"{width}x{height}",
+        'unnormalized_box': box,
+    })
+    return processed
+
+
+def _guienv_process_image_group(args: Tuple[str, List[Dict], str]) -> Dict[str, Any]:
+    """Worker: process every sample for one ``img_id`` and return deltas.
+
+    ``args = (img_id, samples_for_this_image, img_save_path)`` — kept as a
+    tuple so ``Pool.imap_unordered`` can iterate over a generator of these
+    without pre-materialising a giant list.
+    """
+    img_id, samples, img_save_path = args
+    img_path = os.path.join(img_save_path, f"{img_id}.png")
+
+    processed_samples: List[Dict[str, Any]] = []
+    new_invalid: Dict[str, set] = {v: set() for v in INVALID_ELEMENT_CATEGORIES.values()}
+    counters: Dict[str, int] = {'textloc_cnt': 0, 'ocr_cnt': 0, 'total_iterations': 0}
+    errors: List[List[str]] = []
+    used_instructions: List[str] = []
+    # Single-cell mutable cache: lets _guienv_process_single_sample lazy-load
+    # the PNG once and reuse the decoded ndarray for every sample in this
+    # group. Cuts cv2.imread calls from N→1 per group.
+    img_cache: List[Optional[Any]] = [None]
+
+    try:
+        for sample in samples:
+            res = _guienv_process_single_sample(
+                sample, img_path, img_cache,
+                used_instructions, new_invalid, counters,
+            )
+            if res is not None:
+                processed_samples.append(res)
+    except Exception:
+        errors.append([img_id, traceback.format_exc()])
+
+    return {
+        'samples': processed_samples,
+        'img_id': img_id,
+        'new_invalid': {k: list(v) for k, v in new_invalid.items() if v},
+        'counters': counters,
+        'errors': errors,
+    }
+
+
+def _guichat_process_image_group(args: Tuple[str, List[Dict], str]) -> Dict[str, Any]:
+    """Worker: build chat samples for one ``img_id``.
+
+    Each chat sample needs the image's pixel dimensions (via cv2.imread), so
+    most of the wall-clock per image-group is file I/O — exactly the kind of
+    work that benefits from running across many processes.
+    """
+    img_id, samples, img_save_path = args
+    img_path = os.path.join(img_save_path, f"{img_id}.png")
+    short_img_path = img_path[img_path.find(DatasetConfig.DATASET_NAME):]
+
+    out_samples: List[Dict[str, Any]] = []
+    errors: List[List[str]] = []
+
+    try:
+        img = cv2.imread(img_path)
+        if img is None:
+            return {'samples': out_samples, 'errors': errors}
+        height, width = img.shape[:2]
+
+        for sample in samples:
+            try:
+                new_conversations: List[Dict[str, str]] = []
+                unnormalized_boxes: List[List[int]] = []
+                for turn in sample['text']:
+                    if turn['from'] == 'human':
+                        user_query = re.sub(r'<image>.*?</image>', '', turn['value']).strip()
+                        user_query += ' (with bbox) (with <box></box> tags)'
+                        new_conversations.append({'from': 'human', 'value': user_query})
+                    elif turn['from'] == 'gpt':
+                        processed_response, boxes = _guichat_normalise_boxes(
+                            turn['value'], width, height,
+                        )
+                        unnormalized_boxes.extend(boxes)
+                        new_conversations.append({'from': 'gpt', 'value': processed_response})
+
+                out_samples.append({
+                    'id': f'autogui_GUIChat_webqa_0',  # local; main renumbers.
+                    'conversations': new_conversations,
+                    'image': short_img_path,
+                    'unnormalized_boxes': unnormalized_boxes,
+                    'wxh': f"{width}x{height}",
+                })
+            except Exception:
+                errors.append([sample.get('uid', img_id), traceback.format_exc()])
+    except Exception:
+        errors.append([img_id, traceback.format_exc()])
+
+    return {'samples': out_samples, 'errors': errors}
+
+
+def _guichat_normalise_boxes(
+    response: str, width: int, height: int,
+) -> Tuple[str, List[List[int]]]:
+    """Module-level version of ``GUIChatProcessor._process_gpt_response``."""
+    box_matches = list(re.finditer(r'<box>(.*?)</box>', response))
+    if not box_matches:
+        return response, []
+
+    new_response = ''
+    last_end = 0
+    unnormalized_boxes: List[List[int]] = []
+    scale = DatasetConfig.SCALE
+
+    for match in box_matches:
+        box_coords = match.group(1)
+        try:
+            x1, y1, x2, y2 = map(int, box_coords.split())
+            normalized_box = [
+                max(0, min(scale - 1, round(x1 / 1000 * scale))),
+                max(0, min(scale - 1, round(y1 / 1000 * scale))),
+                max(0, min(scale - 1, round(x2 / 1000 * scale))),
+                max(0, min(scale - 1, round(y2 / 1000 * scale))),
+            ]
+            actual_coords = [
+                round(x1 / 1000 * width),
+                round(y1 / 1000 * height),
+                round(x2 / 1000 * width),
+                round(y2 / 1000 * height),
+            ]
+            unnormalized_boxes.append(actual_coords)
+            new_box_str = f"<box>({','.join(map(str, normalized_box))})</box>"
+            new_response += response[last_end:match.start()] + new_box_str
+            last_end = match.end()
+        except ValueError:
+            new_response += response[last_end:match.end()]
+            last_end = match.end()
+
+    new_response += response[last_end:]
+    return new_response, unnormalized_boxes
+
+
+def _guiact_process_trajectory(args: Tuple[str, List[Dict], str]) -> Dict[str, Any]:
+    """Worker: process one full trajectory's sequential steps.
+
+    Each trajectory is independent of every other — steps within a trajectory
+    accumulate ``step_instructions`` history, so we keep them sequential
+    inside the worker but fan trajectories out across the pool.
+    """
+    episode_id, trajectory, img_save_path = args
+    out_samples: List[Dict[str, Any]] = []
+    counters: Dict[str, int] = {'action_planning_count': 0, 'intent_grounding_count': 0}
+    errors: List[List[str]] = []
+
+    # Build a thin processor instance just for the per-step helpers — they
+    # use ``self.config`` and ``self.statistics`` but no cross-trajectory
+    # state, so a fresh instance per worker is fine.
+    processor = GUIActProcessor(DatasetConfig())
+    step_instructions: List[str] = []
+
+    try:
+        for step_idx, sample in enumerate(trajectory):
+            try:
+                processed_sample = processor._process_action_step(
+                    sample, step_idx, step_instructions, img_save_path,
+                )
+                if processed_sample:
+                    out_samples.append(processed_sample)
+                    counters['action_planning_count'] += 1
+            except Exception:
+                errors.append([
+                    sample.get('sample_id', episode_id),
+                    traceback.format_exc(),
+                ])
+    except Exception:
+        errors.append([episode_id, traceback.format_exc()])
+
+    # Merge any sub-counters the inner processor bumped (e.g.
+    # ``intent_grounding_count`` from ``_process_click_action``).
+    counters['intent_grounding_count'] += processor.statistics.get(
+        'intent_grounding_count', 0
+    )
+    return {
+        'samples': out_samples,
+        'episode_id': episode_id,
+        'counters': counters,
+        'errors': errors,
+    }
+
+
+# =============================================================================
 # DATASET PROCESSING CLASSES
 # =============================================================================
 
@@ -264,13 +647,27 @@ class GUIEnvProcessor:
     def __init__(self, config: DatasetConfig):
         self.config = config
         self.invalid_elements = {v: set() for v in INVALID_ELEMENT_CATEGORIES.values()}
-        self.unique_elements = {}
-        self.processed_samples = []
+        self.unique_elements: Dict[str, list] = {}
+        self.processed_samples: List[Dict[str, Any]] = []
+        self.errors: List[List[str]] = []
         self.statistics = {
             'textloc_count': 0,
             'ocr_count': 0,
             'total_iterations': 0
         }
+
+    def _aggregate_guienv_result(self, result: Dict[str, Any]) -> None:
+        """Merge one worker result into ``self.*`` accumulators."""
+        self.processed_samples.extend(result['samples'])
+        for bucket, ids in result['new_invalid'].items():
+            self.invalid_elements.setdefault(bucket, set()).update(ids)
+        cnt = result['counters']
+        self.statistics['textloc_count'] += cnt.get('textloc_cnt', 0)
+        self.statistics['ocr_count'] += cnt.get('ocr_cnt', 0)
+        self.statistics['total_iterations'] += cnt.get('total_iterations', 0)
+        self.errors.extend(result['errors'])
+        # Track that we did see this image so downstream stats are honest.
+        self.unique_elements.setdefault(result['img_id'], [])
     
     def process_dataset(self) -> List[Dict[str, Any]]:
         """
@@ -306,31 +703,70 @@ class GUIEnvProcessor:
         return self.processed_samples
     
     def _process_parquet_file(self, parquet_file: str, dataset_path: str) -> None:
-        """Process a single parquet file from GUIEnv dataset."""
-        # Load data and metadata
+        """Process a single parquet file from GUIEnv dataset.
+
+        Parquet load + base64 image extraction stays on the main process
+        (cheap, runs once per shard), then the per-image-group validation
+        and sample-construction work fans out across ``NUM_WORKERS``.
+        """
         gui_data = pd.read_parquet(parquet_file)
         metadata_file = parquet_file.replace("images.parquet", "data.json")
-        
         with open(metadata_file, "r") as f:
             metadata = json.load(f)
-        
-        # Group samples by image ID
+
         samples_by_image = defaultdict(list)
         for sample in metadata:
             samples_by_image[sample['image_id']].append(sample)
-        
-        # Ensure images are saved
+
         img_save_path = os.path.join(dataset_path, "imgs")
         os.makedirs(img_save_path, exist_ok=True)
         self._save_images(gui_data, img_save_path)
-        
-        # Process each image group
-        for group_idx, (img_id, samples) in tqdm(
-            enumerate(samples_by_image.items()), 
-            total=len(samples_by_image), 
-            desc='Processing GUIEnv samples...'
-        ):
-            self._process_image_group(img_id, samples, img_save_path, group_idx, len(samples_by_image))
+
+        work_items = [
+            (img_id, samples, img_save_path)
+            for img_id, samples in samples_by_image.items()
+        ]
+        invalid_record_file = os.path.join(self.config.SAVE_DIR, 'invalid_elem_record.json')
+        invalid_ids_frozen = frozenset(
+            sid for bucket in self.invalid_elements.values() for sid in bucket
+        )
+
+        workers = self.config.workers_for('GUIEnv')
+        use_parallel = workers > 1
+        if use_parallel:
+            # chunksize ~ N / (workers * 4): high enough to amortise IPC, low
+            # enough that imap_unordered streams progress per item.
+            chunksize = max(1, min(32, len(work_items) // max(1, workers * 4)))
+            # ``maxtasksperchild`` recycles a worker every N image-groups —
+            # prevents heap growth from long-lived workers and forces clean
+            # subprocess state for pytesseract.
+            with mp.Pool(
+                processes=workers,
+                initializer=_guienv_init_worker,
+                initargs=(invalid_ids_frozen,),
+                maxtasksperchild=500,
+            ) as pool:
+                pbar = tqdm(
+                    pool.imap_unordered(
+                        _guienv_process_image_group, work_items, chunksize=chunksize,
+                    ),
+                    total=len(work_items),
+                    desc=f'GUIEnv ×{workers}',
+                    smoothing=0.05,
+                )
+                completed = 0
+                for result in pbar:
+                    self._aggregate_guienv_result(result)
+                    completed += 1
+                    # Same checkpoint cadence as the original sequential loop.
+                    if completed % 5000 == 0:
+                        save_invalid_elements(self.invalid_elements, invalid_record_file)
+        else:
+            # Sequential fallback also needs the global initialiser set so
+            # the worker's O(1) skip-list lookup works in-process.
+            _guienv_init_worker(invalid_ids_frozen)
+            for item in tqdm(work_items, total=len(work_items), desc='GUIEnv'):
+                self._aggregate_guienv_result(_guienv_process_image_group(item))
     
     def _save_images(self, gui_data: pd.DataFrame, img_save_path: str) -> None:
         """Save base64 encoded images to disk."""
@@ -548,46 +984,70 @@ class GUIChatProcessor:
     
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.processed_samples = []
-    
+        self.processed_samples: List[Dict[str, Any]] = []
+        self.errors: List[List[str]] = []
+        self.image_count = 0
+
     def process_dataset(self) -> List[Dict[str, Any]]:
         """Process the complete GUIChat dataset."""
         dataset_path = os.path.join(self.config.DATA_ROOT, "GUIChat")
         parquet_files = glob.glob(os.path.join(dataset_path, "*.parquet"))
-        
+
         print(f"Processing {len(parquet_files)} GUIChat parquet files...")
-        
+
         for parquet_file in parquet_files:
             print(f"Processing {parquet_file}")
             self._process_parquet_file(parquet_file, dataset_path)
-        
+
         print(f"Generated {len(self.processed_samples)} GUIChat samples")
         return self.processed_samples
-    
+
     def _process_parquet_file(self, parquet_file: str, dataset_path: str) -> None:
-        """Process a single parquet file from GUIChat dataset."""
-        gui_data = pd.read_parquet(parquet_file)
+        """Process one GUIChat parquet shard via the worker pool.
+
+        The parquet read and metadata grouping happen on the main process
+        (cheap, one-time per shard). The per-image cv2.imread + box
+        normalisation is the slow part and runs in parallel.
+        """
+        gui_data = pd.read_parquet(parquet_file)  # noqa: F841 (kept for parity)
         metadata_file = parquet_file.replace("images.parquet", "data.json")
-        
         with open(metadata_file, "r") as f:
             metadata = json.load(f)
-        
-        # Group samples by image ID
+
         samples_by_image = defaultdict(list)
         for sample in metadata:
             samples_by_image[sample['image_id']].append(sample)
-        
-        # Setup image save path
+
         img_save_path = os.path.join(dataset_path, "imgs")
         os.makedirs(img_save_path, exist_ok=True)
-        
-        # Process each image group
-        for img_id, samples in tqdm(
-            samples_by_image.items(), 
-            total=len(samples_by_image), 
-            desc='Processing GUIChat samples...'
-        ):
-            self._process_chat_samples(img_id, samples, img_save_path)
+
+        work_items = [
+            (img_id, samples, img_save_path)
+            for img_id, samples in samples_by_image.items()
+        ]
+        self.image_count += len(work_items)
+
+        workers = self.config.workers_for('GUIChat')
+        use_parallel = workers > 1
+        if use_parallel:
+            chunksize = max(1, min(64, len(work_items) // max(1, workers * 4)))
+            with mp.Pool(processes=workers, maxtasksperchild=500) as pool:
+                pbar = tqdm(
+                    pool.imap_unordered(
+                        _guichat_process_image_group, work_items, chunksize=chunksize,
+                    ),
+                    total=len(work_items),
+                    desc=f'GUIChat ×{workers}',
+                    smoothing=0.05,
+                )
+                for result in pbar:
+                    self.processed_samples.extend(result['samples'])
+                    self.errors.extend(result['errors'])
+        else:
+            for item in tqdm(work_items, total=len(work_items), desc='GUIChat'):
+                result = _guichat_process_image_group(item)
+                self.processed_samples.extend(result['samples'])
+                self.errors.extend(result['errors'])
     
     def _process_chat_samples(self, img_id: str, samples: List[Dict], img_save_path: str) -> None:
         """Process chat samples for a single image."""
@@ -696,7 +1156,9 @@ class GUIActProcessor:
     
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.processed_samples = []
+        self.processed_samples: List[Dict[str, Any]] = []
+        self.errors: List[List[str]] = []
+        self.trajectory_count = 0
         self.statistics = {
             'action_planning_count': 0,
             'intent_grounding_count': 0
@@ -799,16 +1261,47 @@ class GUIActProcessor:
         return True
     
     def _process_trajectories(self, trajectories: Dict[str, List[Dict]], img_save_path: str) -> None:
-        """Process all trajectories in the dataset."""
-        for item_idx, (episode_id, trajectory) in tqdm(
-            enumerate(trajectories.items()), 
-            total=len(trajectories), 
-            desc=f'Processing {len(trajectories)} trajectories...'
-        ):
-            if self.config.DEBUG_MODE and item_idx % 100 != 0:
-                continue
-            
-            self._process_single_trajectory(episode_id, trajectory, img_save_path)
+        """Process all trajectories in the dataset.
+
+        Trajectories are independent of each other (steps within a trajectory
+        share state, but trajectories themselves don't), so we fan out across
+        the worker pool at the trajectory level.
+        """
+        # Apply DEBUG sub-sampling here (was inline in the original loop) so
+        # the worker total + tqdm match the actual work.
+        items = list(trajectories.items())
+        if self.config.DEBUG_MODE:
+            items = [it for i, it in enumerate(items) if i % 100 == 0]
+        self.trajectory_count += len(items)
+
+        work_items = [(ep_id, traj, img_save_path) for ep_id, traj in items]
+
+        workers = self.config.workers_for('GUIAct')
+        use_parallel = workers > 1
+        if use_parallel:
+            chunksize = max(1, min(64, len(work_items) // max(1, workers * 4)))
+            with mp.Pool(processes=workers, maxtasksperchild=1000) as pool:
+                pbar = tqdm(
+                    pool.imap_unordered(
+                        _guiact_process_trajectory, work_items, chunksize=chunksize,
+                    ),
+                    total=len(work_items),
+                    desc=f'GUIAct ×{workers}',
+                    smoothing=0.05,
+                )
+                for result in pbar:
+                    self._aggregate_guiact_result(result)
+        else:
+            for item in tqdm(work_items, total=len(work_items), desc='GUIAct'):
+                self._aggregate_guiact_result(_guiact_process_trajectory(item))
+
+    def _aggregate_guiact_result(self, result: Dict[str, Any]) -> None:
+        """Merge one trajectory result into the running accumulators."""
+        self.processed_samples.extend(result['samples'])
+        cnt = result['counters']
+        self.statistics['action_planning_count'] += cnt.get('action_planning_count', 0)
+        self.statistics['intent_grounding_count'] += cnt.get('intent_grounding_count', 0)
+        self.errors.extend(result['errors'])
     
     def _process_single_trajectory(self, episode_id: str, trajectory: List[Dict], img_save_path: str) -> None:
         """Process a single trajectory containing multiple steps."""
@@ -1248,43 +1741,131 @@ Action distribution: {dict(action_stats)}
 # MAIN PROCESSING PIPELINE
 # =============================================================================
 
-def save_dataset_results(samples: List[Dict[str, Any]], dataset_name: str, 
-                        config: DatasetConfig) -> None:
-    """
-    Save processed dataset samples and generate statistics.
-    
+def save_dataset_results(
+    samples: List[Dict[str, Any]],
+    dataset_name: str,
+    config: DatasetConfig,
+    *,
+    processor: Optional[Any] = None,
+) -> None:
+    """Save processed dataset samples, the unified info.json, and the preview.
+
     Args:
-        samples: List of processed samples
-        dataset_name: Name of the dataset (for filename)
-        config: Configuration object
+        samples: List of processed samples.
+        dataset_name: One of ``'GUIEnv'`` / ``'GUIChat'`` / ``'GUIAct'`` —
+            used both for filename construction and for picking the canonical
+            per-task counters surfaced in the report.
+        config: The active :class:`DatasetConfig` instance.
+        processor: The subprocessor that generated ``samples``. Optional —
+            when provided, its ``errors`` / ``invalid_elements`` /
+            ``statistics`` feed the unified ``_info.json`` (errors_summary,
+            invalid_breakdown, run_stats).
     """
     if not samples:
         print(f"No samples to save for {dataset_name}")
         return
-    
-    # Generate filename
+
+    # Filename layout preserves the existing convention so downstream paths
+    # keep working.
     filename_parts = [dataset_name.lower(), config.CURRENT_SPLIT]
-    
     if dataset_name == 'GUIAct':
-        filename_parts.extend([config.CURRENT_DEVICE_TYPE])
+        filename_parts.append(config.CURRENT_DEVICE_TYPE)
         if config.USE_ACTION_REFEXP:
             filename_parts.append('wActRef')
-    
     filename_parts.extend([f's{config.SCALE}', str(len(samples))])
     filename = '-'.join(filename_parts) + '.json'
-    
     save_path = os.path.join(config.SAVE_DIR, filename)
-    
-    # Save main dataset
-    with open(save_path, "w") as f:
-        json.dump(samples, f, indent=2, ensure_ascii=False)
-    
-    # Save sample subset
+
+    # Renumber per-task IDs globally — workers each start their local
+    # ``<n>`` from 0, so without this samples can share IDs.
+    renumber_sample_ids(samples)
+
+    # Build the per-subprocessor canonical counters + report inputs.
+    counters: Dict[str, int]
+    tasks_enabled: Dict[str, bool]
+    images: Dict[str, int] = {'processed': 0, 'valid': 0}
+    elements: Dict[str, Any] = {'iterated': len(samples), 'invalid': 0}
+
+    if dataset_name == 'GUIEnv' and processor is not None:
+        counters = {
+            'text_loc_cnt': processor.statistics.get('textloc_count', 0),
+            'ocr_cnt': processor.statistics.get('ocr_count', 0),
+        }
+        tasks_enabled = {'TextLoc': config.ENABLE_TEXTLOC, 'OCR': config.ENABLE_OCR}
+        images = {
+            'processed': len(processor.unique_elements),
+            'valid': sum(1 for v in processor.unique_elements.values() if v) or len(samples),
+        }
+        elements = {
+            'iterated': processor.statistics.get('total_iterations', len(samples)),
+            'invalid': sum(len(v) for v in processor.invalid_elements.values()),
+            'invalid_breakdown': {k: len(v) for k, v in processor.invalid_elements.items()},
+        }
+    elif dataset_name == 'GUIChat' and processor is not None:
+        counters = {'webqa_cnt': len(samples)}
+        tasks_enabled = {'WebQA': True}
+        images = {'processed': processor.image_count, 'valid': len(samples)}
+    elif dataset_name == 'GUIAct' and processor is not None:
+        counters = {
+            'actionplanning_cnt': processor.statistics.get('action_planning_count', 0),
+            'intentgnd_cnt': processor.statistics.get('intent_grounding_count', 0),
+        }
+        tasks_enabled = {
+            'ActionPlanning': True,
+            'IntentGnd': config.ENABLE_INTENT_GND,
+        }
+        images = {'processed': processor.trajectory_count, 'valid': len(samples)}
+    else:
+        # Generic fallback — unknown subset, just report the totals.
+        counters = {}
+        tasks_enabled = {}
+
+    errors: List[List[str]] = (
+        list(getattr(processor, 'errors', [])) if processor is not None else []
+    )
+
+    # Surface mass-failures before the structured report — same loud
+    # end-of-run convention as the other make_*_data scripts.
+    print_error_summary(errors, total_tasks=elements.get('iterated', len(samples)))
+
+    save_run_info(
+        dataset=f'GUICourse ({dataset_name})',
+        output_path=save_path,
+        samples=samples,
+        counters=counters,
+        config={
+            'subtask': dataset_name,
+            'split': config.CURRENT_SPLIT,
+            'device_type': config.CURRENT_DEVICE_TYPE,
+            'scale': config.SCALE,
+            'debug_mode': config.DEBUG_MODE,
+            'skip_validation': config.SKIP_VALIDATION,
+            'skip_ocr_validation': config.SKIP_OCR_VALIDATION,
+            'use_action_prompt': config.USE_ACTION_PROMPT,
+            'use_action_refexp': config.USE_ACTION_REFEXP,
+            'num_workers': config.NUM_WORKERS,
+            'effective_workers': config.workers_for(dataset_name),
+        },
+        images=images,
+        elements=elements,
+        tasks_enabled=tasks_enabled,
+        extra_sections={
+            'errors_summary': summarize_errors(errors),
+            'errors_total': len(errors),
+        },
+        write_preview=False,  # we still write our own larger preview below.
+    )
+
+    # Larger preview for inspection (256 samples vs. the helper's default 128).
     sample_size = min(len(samples), 256)
     sample_path = save_path.replace('.json', '_sample.json')
     with open(sample_path, "w") as f:
         json.dump(random.sample(samples, sample_size), f, indent=2, ensure_ascii=False)
-    
+
+    # Full dataset.
+    with open(save_path, "w") as f:
+        json.dump(samples, f, indent=2, ensure_ascii=False)
+
     print(f"Saved {len(samples)} samples to {save_path}")
 
 def main() -> None:
@@ -1306,25 +1887,25 @@ def main() -> None:
     print("=" * 60)
     
     # Process GUIEnv dataset
-    if 'GUIEnv' in config.SUBTASK:  # Set to True to enable GUIEnv processing
+    if 'GUIEnv' in config.SUBTASK:
         print("\nProcessing GUIEnv Dataset...")
         gui_env_processor = GUIEnvProcessor(config)
         gui_env_samples = gui_env_processor.process_dataset()
-        save_dataset_results(gui_env_samples, 'GUIEnv', config)
-    
+        save_dataset_results(gui_env_samples, 'GUIEnv', config, processor=gui_env_processor)
+
     # Process GUIChat dataset
-    if 'GUIChat' in config.SUBTASK:  # Set to True to enable GUIChat processing
+    if 'GUIChat' in config.SUBTASK:
         print("\nProcessing GUIChat Dataset...")
         gui_chat_processor = GUIChatProcessor(config)
         gui_chat_samples = gui_chat_processor.process_dataset()
-        save_dataset_results(gui_chat_samples, 'GUIChat', config)
-    
+        save_dataset_results(gui_chat_samples, 'GUIChat', config, processor=gui_chat_processor)
+
     # Process GUIAct dataset
-    if 'GUIAct' in config.SUBTASK:  # Currently enabled
+    if 'GUIAct' in config.SUBTASK:
         print("\nProcessing GUIAct Dataset...")
         gui_act_processor = GUIActProcessor(config)
         gui_act_samples = gui_act_processor.process_dataset()
-        save_dataset_results(gui_act_samples, 'GUIAct', config)
+        save_dataset_results(gui_act_samples, 'GUIAct', config, processor=gui_act_processor)
     
     print("\n" + "=" * 60)
     print("GUICourse Dataset Processing Pipeline Complete!")

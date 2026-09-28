@@ -3,8 +3,8 @@ import os, json
 from tqdm import tqdm
 from pprint import pprint
 
-file = "/data/hongxin_li/scaling_exp/UIPro_processed/AutoGUI_FuncGnd_s1000_490k_ARoom.json"
-img_dir = "/mnt/shared-storage/groups/stepone_mm/lhx/ui_data/"
+file = "/volume/pt-coder/users/gji/projects/UIPro/data/WebUI_processed/WebUI_scale1000_488k.json"
+img_dir = "/volume/pt-coder/users/gji/projects/UIPro/data"
 
 saveto = os.path.join(os.path.dirname(file), 'LlamaFactory_data')
 os.makedirs(saveto, exist_ok=True)

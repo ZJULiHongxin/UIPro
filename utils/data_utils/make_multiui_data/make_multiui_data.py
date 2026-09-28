@@ -40,12 +40,15 @@ Output:
 from __future__ import annotations
 
 import json
+import ijson
+import multiprocessing as mp
 import os
 import random
 import re
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import magic
 from tqdm import tqdm
 
@@ -53,6 +56,13 @@ from utils.data_utils.task_prompt_lib import (
     make_intentgnd_sample,
     web_loca_all_point_prompt,
     WITHBOX_TAG
+)
+from utils.data_utils.misc import is_pure_color
+from utils.data_utils.run_info import (
+    print_error_summary,
+    renumber_sample_ids,
+    save_run_info,
+    summarize_errors,
 )
 
 # =============================================================================
@@ -74,6 +84,7 @@ MULTIUI_TASK_TYPES = {
 
 # Coordinate normalization parameters
 SCALE: int = 1000  # Normalization scale for bounding box coordinates
+DEBUG: bool = False
 
 # Task processing flags - enable/disable specific task processing
 ENABLE_UI_CAPTION: bool = False     # UI description generation tasks
@@ -84,16 +95,37 @@ ENABLE_GROUNDING: bool = True       # Element and action grounding tasks
 # Processing control flags
 SKIP_INTEGRITY_CHECKS: bool = False  # Skip sample validation and integrity checks
 
+# Parallelism: 1 forces sequential. Per-sample work in the grounding branch
+# does file I/O (``magic.from_file``) which dominates wall-clock time on
+# large datasets, so multiprocessing pays off even though each task is small.
+NUM_WORKERS: int = max(1, (os.cpu_count() or 1) - 1)
+
+# Set by ``_init_worker`` inside each Pool child so the per-sample worker can
+# do O(1) membership checks against the cumulative invalid-sample skip-list
+# without re-pickling it for every task.
+_INVALID_IDS_CACHE: frozenset = frozenset()
+
+
+def _init_worker(invalid_ids: frozenset) -> None:
+    """Pool initializer: install the invalid-sample skip-list in every worker.
+
+    Using a global-via-initializer pattern keeps IPC payloads tiny — without
+    it, every task arg would re-pickle the full skip-list across processes.
+    Works for both ``fork`` (default on Linux) and ``spawn`` start methods.
+    """
+    global _INVALID_IDS_CACHE
+    _INVALID_IDS_CACHE = invalid_ids
+
 # =============================================================================
 # File Paths Configuration
 # =============================================================================
 
 # Input data paths
-MULTIUI_SAMPLE_FILE: str = "/mnt/vdb1/hongxin_li/MultiUI/stage1_data.json"
-IMG_DIR: str = f"/mnt/vdb1/hongxin_li/{DATASET_NAME}"
+MULTIUI_SAMPLE_FILE: str = "/volume/pt-coder/users/gji/projects/UIPro/data/MultiUI/stage1_data.json"
+IMG_DIR: str = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}"
 
 # Output paths
-SAVE_ROOT: str = f"/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp/{DATASET_NAME}_processed"
+SAVE_ROOT: str = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}_processed"
 STATS_FILE: str = os.path.join(SAVE_ROOT, "stats.json")
 
 # =============================================================================
@@ -572,8 +604,7 @@ def process_webqa_sample(sample: Dict[str, str], task_counters: Dict[str, int]) 
         processed_sample['id'] = f'autogui_multiui_embedqa_{task_counters["embed_qa"]}'
         task_counters['embed_qa'] += 1
         return processed_sample
-    else:
-        1+1
+
     # Sample doesn't match expected WebQA task types
     return None
 
@@ -670,6 +701,22 @@ def process_grounding_sample(
         - Bounding box coordinate validity
         - Query extraction success
         - Duplicate invalid sample filtering
+
+    Example:
+    {
+    "id": "v4_50K_2_curated_v2_element_ground_bbox_35047",
+    "image": "MultiUI/v0.6_5M/crawled_data_vTraining8_pc1280/02195597_goodandbeautifulbooklist.com_book_rider/image_inputs_anyres/start0_0_1280_1802_crop.png",
+    "conversations": [
+        {
+        "from": "human",
+        "value": "<image>\nPlease find the bounding box coordinates in the format (top-left x, top-left y, bottom-right x, bottom-right y) for the given element description. Ensure the coordinates are floating point numbers between 0 and 1. Description: Bookshop"
+        },
+        {
+        "from": "gpt",
+        "value": "[0.651, 0.222, 0.72, 0.233]"
+        }
+    ]
+    }
     """
     # Skip processing if grounding tasks are disabled
     if not ENABLE_GROUNDING:
@@ -696,32 +743,40 @@ def process_grounding_sample(
 
     bbox_match = bbox_matches[0]  # Use first bounding box found
 
-    # Get image dimensions for coordinate conversion
-    img_path = os.path.join(os.path.dirname(IMG_DIR), sample['image'])
-    try:
-        image_width, image_height = get_image_dimensions(img_path)
-    except ValueError:
+    # Extract target query from user prompt FIRST — pure string work, no I/O.
+    # Doing it before the image read means failed-extraction samples never
+    # pay the disk cost.
+    query = extract_query_from_user_prompt(user_prompt)
+    if query is None:
+        task_counters['invalid_elem'].append(sample_id)
+        task_counters['noquery_elem'] += 1
         return None
+
+    # Load the image once: needed both for dimensions (replacing the previous
+    # ``magic.from_file`` call) and for the blank/pure-colour check below.
+    img_path = os.path.join(os.path.dirname(IMG_DIR), sample['image'])
+    img = cv2.imread(img_path)
+    if img is None:
+        # Corrupt or missing file — silently skip (matches the previous
+        # behaviour when ``get_image_dimensions`` failed).
+        return None
+    image_height, image_width = img.shape[:2]
 
     # Convert normalized coordinates to pixel coordinates
     pixel_bbox = convert_normalized_to_pixel_coords(
         [float(coord) for coord in bbox_match], image_height, image_width
     )
 
-    # TODO: Add pure color check for invalid elements if needed
-    # img = cv2.imread(img_path)
-    # if img is not None and is_pure_color(img, pixel_bbox):
-    #     task_counters['invalid_elem'].append(sample_id)
-    #     return None
+    # Blank/pure-colour element check: drop elements whose bbox region is a
+    # solid block of one colour — there's nothing visible for the model to
+    # ground on, so these are noisy training targets.
+    if is_pure_color(img, pixel_bbox):
+        task_counters['invalid_elem'].append(sample_id)
+        task_counters['blank_elem'] += 1
+        return None
 
     # Normalize coordinates for training
     normalized_bbox_str = normalize_bbox_coordinates_to_string(bbox_match)
-
-    # Extract target query from user prompt
-    query = extract_query_from_user_prompt(user_prompt)
-    if query is None:
-        task_counters['invalid_elem'].append(sample_id)
-        return None
 
     # Process based on grounding task type
     if 'element_ground_bbox' in sample_id:
@@ -830,6 +885,78 @@ def save_processed_data(
             json.dump(caption_samples, f)
 
 
+def _process_one_multiui_sample(sample: Dict) -> Dict[str, Any]:
+    """Worker: route a single MultiUI sample through its task-specific pipeline.
+
+    Pure function with respect to the parent process — uses a local counters
+    dict (so generated task IDs collide across workers but are renumbered
+    globally after aggregation) and reads the invalid-sample skip-list from
+    the module-level ``_INVALID_IDS_CACHE`` (set by ``_init_worker``).
+
+    Returns a small pickleable dict:
+      - ``category``: ``'caption'`` | ``'gnd_ref_qa'`` | ``None`` (sample dropped).
+      - ``sample``: the processed sample, or ``None``.
+      - ``counters``: local task counters / invalid_elem additions to merge.
+      - ``error``: ``[sample_id, traceback_str]`` or ``None``.
+      - ``skipped``: ``True`` if the sample matched a ``SKIPPED_TASKS`` entry
+        (so the main process doesn't double-count it under ``processed``).
+    """
+    sample_id = sample.get('id', '')
+
+    # Skip deprecated/problematic task types upfront — these are not counted as
+    # `processed` (mirrors the original ``continue`` placement).
+    if any(skipped in sample_id for skipped in SKIPPED_TASKS):
+        return {
+            'category': None, 'sample': None,
+            'counters': initialize_processing_counters(),
+            'error': None, 'skipped': True,
+        }
+
+    # Don't mutate the caller's dict (matters when running sequentially).
+    sample = dict(sample)
+    sample['image'] = f"{DATASET_NAME}/{sample['image']}" # Example: 'MultiUI/v0.6_5M/crawled_data_vTraining8_pc1280/02195597_goodandbeautifulbooklist.com_book_rider/image_inputs_anyres/start0_0_1280_1802_crop.png'
+
+    counters = initialize_processing_counters()
+    counters['processed'] = 1
+    category: Optional[str] = None
+    processed_sample: Optional[Dict] = None
+    error: Optional[List[str]] = None
+
+    try:
+        if 'meta_generate' in sample_id or 'caption' in sample_id:
+            processed_sample = process_ui_caption_sample(sample, counters)
+            if processed_sample:
+                category = 'caption'
+
+        elif 'webqa' in sample_id or 'embed_qa' in sample_id:
+            processed_sample = process_webqa_sample(sample, counters)
+            if processed_sample:
+                category = 'gnd_ref_qa'
+
+        elif 'OCR' in sample_id or 'title_identification' in sample_id:
+            processed_sample = process_ocr_sample(sample, counters)
+            if processed_sample:
+                category = 'gnd_ref_qa'
+
+        elif 'element_ground_bbox' in sample_id or 'action_ground_bbox' in sample_id:
+            processed_sample = process_grounding_sample(
+                sample, _INVALID_IDS_CACHE, counters
+            )
+            if processed_sample:
+                category = 'gnd_ref_qa'
+
+    except Exception:
+        error = [sample_id, traceback.format_exc()]
+
+    return {
+        'category': category,
+        'sample': processed_sample,
+        'counters': counters,
+        'error': error,
+        'skipped': False,
+    }
+
+
 def process_all_samples(
     multiui_data: List[Dict],
     invalid_ids: List[str],
@@ -837,72 +964,70 @@ def process_all_samples(
     caption_samples: List[Dict],
     gnd_ref_qa_samples: List[Dict]
 ) -> List[List]:
+    """Dispatch all MultiUI samples through ``_process_one_multiui_sample``.
+
+    Uses ``multiprocessing.Pool.imap_unordered`` when ``NUM_WORKERS > 1`` and
+    falls back to an in-process loop otherwise (single-process is useful for
+    debugging or low-resource environments). The aggregator merges each
+    worker's locals into the caller's accumulators in one place to keep the
+    bookkeeping logic DRY.
+
+    Returns a list of ``[sample_id, traceback_str]`` records, one per
+    exception caught inside a worker.
     """
-    Process all samples in the MultiUI dataset according to their task types.
+    errors: List[List[str]] = []
 
-    Iterates through each sample, applies appropriate processing based on task type,
-    handles exceptions, and collects results into appropriate output collections.
+    # Aggregate one worker result into the caller's accumulators.
+    def _aggregate(result: Dict[str, Any]) -> None:
+        if result['skipped']:
+            return
+        # Per-task integer counters.
+        for key, value in result['counters'].items():
+            if key == 'invalid_elem':
+                counters['invalid_elem'].extend(value)
+            else:
+                counters[key] += value
+        category = result['category']
+        if result['sample'] is not None:
+            if category == 'caption':
+                caption_samples.append(result['sample'])
+            elif category == 'gnd_ref_qa':
+                gnd_ref_qa_samples.append(result['sample'])
+        if result['error'] is not None:
+            errors.append(result['error'])
 
-    Args:
-        multiui_data: List of raw sample dictionaries to process
-        invalid_ids: List of previously identified invalid sample IDs to skip
-        counters: Dictionary of counters for tracking processing statistics
-        caption_samples: List to collect processed UI caption samples
-        gnd_ref_qa_samples: List to collect processed grounding/QA/OCR samples
+    invalid_ids_frozen = frozenset(invalid_ids)
+    use_parallel = NUM_WORKERS > 1
 
-    Returns:
-        List of exception records, where each record contains [sample_idx, traceback]
+    if use_parallel:
+        # chunksize ~ N / (workers * 4): high enough to amortize IPC for the
+        # many tiny tasks (most samples are pure-string manipulation) while
+        # still letting imap_unordered stream results back per item.
+        chunksize = max(1, min(256, len(multiui_data) // max(1, NUM_WORKERS * 4)))
+        with mp.Pool(
+            processes=NUM_WORKERS,
+            initializer=_init_worker,
+            initargs=(invalid_ids_frozen,),
+        ) as pool:
+            pbar = tqdm(
+                pool.imap_unordered(
+                    _process_one_multiui_sample, multiui_data, chunksize=chunksize
+                ),
+                total=len(multiui_data),
+                desc=f"MultiUI ×{NUM_WORKERS}",
+                smoothing=0.05,
+            )
+            for result in pbar:
+                _aggregate(result)
+    else:
+        # Sequential path also needs the skip-list installed for the worker's
+        # `_INVALID_IDS_CACHE` global lookup.
+        _init_worker(invalid_ids_frozen)
+        for sample in tqdm(multiui_data, total=len(multiui_data),
+                           desc="Processing MultiUI samples"):
+            _aggregate(_process_one_multiui_sample(sample))
 
-    Processing Flow:
-        1. Skip unwanted task types based on SKIPPED_TASKS
-        2. Update image path to include dataset prefix
-        3. Route sample to appropriate processing function based on task type
-        4. Handle exceptions and track problematic samples
-    """
-    exception_sample_idxs = []
-
-    # Process each sample with progress tracking
-    for sample_idx, sample in tqdm(enumerate(multiui_data), total=len(multiui_data),
-                                   desc="Processing MultiUI samples"):
-        sample_id = sample['id']
-
-        # Skip deprecated or problematic task types
-        if any(skipped_task in sample_id for skipped_task in SKIPPED_TASKS):
-            continue
-
-        counters['processed'] += 1
-
-        # Update image path to include dataset directory prefix
-        sample['image'] = f"{DATASET_NAME}/{sample['image']}"
-
-        try:
-            # Route sample to appropriate processing function based on task type
-            if 'meta_generate' in sample_id or 'caption' in sample_id:
-                processed_sample = process_ui_caption_sample(sample, counters)
-                if processed_sample:
-                    caption_samples.append(processed_sample)
-
-            elif 'webqa' in sample_id or 'embed_qa' in sample_id:
-                processed_sample = process_webqa_sample(sample, counters)
-                if processed_sample:
-                    gnd_ref_qa_samples.append(processed_sample)
-
-            elif 'OCR' in sample_id or 'title_identification' in sample_id:
-                processed_sample = process_ocr_sample(sample, counters)
-                if processed_sample:
-                    gnd_ref_qa_samples.append(processed_sample)
-
-            elif 'element_ground_bbox' in sample_id or 'action_ground_bbox' in sample_id:
-                processed_sample = process_grounding_sample(sample, invalid_ids, counters)
-                if processed_sample:
-                    gnd_ref_qa_samples.append(processed_sample)
-
-        except (ValueError, KeyError, IndexError) as e:
-            # Track exceptions with sample index and full traceback for debugging
-            exception_sample_idxs.append([sample_idx, traceback.format_exc()])
-            print(f"Error processing sample {sample_idx} ({sample_id}): {e}")
-
-    return exception_sample_idxs
+    return errors
 
 
 def prepare_processing_statistics(
@@ -1007,8 +1132,21 @@ def initialize_processing_counters() -> Dict:
         'elemgnd': 0,        # Element grounding task counter
         'intentgnd': 0,      # Intent grounding task counter
         'processed': 0,      # Total processed samples counter
-        'invalid_elem': []   # List of invalid sample IDs
+        'invalid_elem': [],  # List of invalid sample IDs (any reason)
+        # Categorised rejection reasons (subsets of `invalid_elem`):
+        'blank_elem': 0,     # Rejected because the bbox region is pure colour.
+        'noquery_elem': 0,   # Rejected because query extraction returned None.
     }
+
+def load_samples(filepath, num_samples=128):
+    samples = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        parser = ijson.items(f, 'item')  # Adjust path based on your JSON structure
+        for i, sample in enumerate(parser):
+            if i >= num_samples:
+                break
+            samples.append(sample)
+    return samples
 
 
 def load_and_prepare_data() -> Tuple[List[Dict], List[str]]:
@@ -1025,13 +1163,97 @@ def load_and_prepare_data() -> Tuple[List[Dict], List[str]]:
         json.JSONDecodeError: If the sample file contains invalid JSON
     """
     # Load raw MultiUI dataset
-    with open(MULTIUI_SAMPLE_FILE, 'r', encoding='utf-8') as f:
-        multiui_data = json.load(f)
+
+    if DEBUG:
+        multiui_data = load_samples(MULTIUI_SAMPLE_FILE, 128)
+    else:
+        with open(MULTIUI_SAMPLE_FILE, 'r', encoding='utf-8') as f:
+            multiui_data = json.load(f)
 
     # Load previously identified invalid samples for skipping
     invalid_ids = load_previous_invalid_samples()
 
     return multiui_data, invalid_ids
+
+
+def _write_unified_info(
+    output_path: str,
+    samples: List[Dict],
+    counters: Dict[str, Any],
+    total_samples: int,
+    errors: List[List[str]],
+    *,
+    section_name: str,
+) -> None:
+    """Emit the structured ``_info.json`` sibling for one output split.
+
+    MultiUI uses two output files (caption-only and grounding/QA/OCR), so this
+    helper is called once per split with the matching counters mapped into
+    canonical ``<task>_cnt`` keys.
+    """
+    # Translate MultiUI's short counter names into the canonical
+    # ``<task>_cnt`` names so save_run_info renders them with the
+    # CamelCase task labels from TASK_DISPLAY_NAMES.
+    canonical_counters = {
+        'uicaption_cnt': counters['uicaption'],
+        'embedcaption_cnt': counters['embedcaption'],
+        'webqa_cnt': counters['webqa'],
+        'embedqa_cnt': counters['embed_qa'],
+        'ocr_cnt': counters['ocr'],
+        'titleocr_cnt': counters['titleocr'],
+        'elemgnd_cnt': counters['elemgnd'],
+        'intentgnd_cnt': counters['intentgnd'],
+    }
+    save_run_info(
+        dataset=f'{DATASET_NAME} ({section_name})',
+        output_path=output_path,
+        samples=samples,
+        counters=canonical_counters,
+        config={
+            'scale': SCALE,
+            'enable_ui_caption': ENABLE_UI_CAPTION,
+            'enable_webqa': ENABLE_WEBQA,
+            'enable_ocr': ENABLE_OCR,
+            'enable_grounding': ENABLE_GROUNDING,
+            'skip_integrity_checks': SKIP_INTEGRITY_CHECKS,
+            'skipped_tasks': SKIPPED_TASKS,
+            'num_workers': NUM_WORKERS,
+        },
+        # MultiUI iterates samples (not images), so treat each sample as a
+        # "sample-image": images.processed == sample-level count to keep the
+        # canonical ratio meaningful.
+        images={
+            'processed': counters['processed'],
+            'valid': len(samples),
+        },
+        elements={
+            'iterated': total_samples,
+            'invalid': len(counters['invalid_elem']),
+            # Rejection-reason breakdown. ``blank_elem`` is the pure-colour
+            # check; ``noquery_elem`` is the query-extraction failure; the
+            # remainder (if any) is the cumulative pre-run skip-list.
+            'invalid_breakdown': {
+                'blank_elem': counters.get('blank_elem', 0),
+                'noquery_elem': counters.get('noquery_elem', 0),
+                'other': max(
+                    0,
+                    len(counters['invalid_elem'])
+                    - counters.get('blank_elem', 0)
+                    - counters.get('noquery_elem', 0),
+                ),
+            },
+        },
+        extra_sections={
+            'errors_summary': summarize_errors(errors),
+            'errors_total': len(errors),
+            # The full invalid-id list is useful as a skip-list seed for the
+            # next run, but capped here so info.json stays human-readable.
+            'invalid_elem_sample': counters['invalid_elem'][:200],
+            'invalid_elem_total': len(counters['invalid_elem']),
+        },
+        write_preview=False,  # save_processed_data already emits a `_sample.json`
+        write_report_txt=False,
+    )
 
 
 def make_multiui_data() -> None:
@@ -1041,9 +1263,10 @@ def make_multiui_data() -> None:
     Orchestrates the complete data processing pipeline:
     1. Load raw dataset and previous processing state
     2. Initialize processing counters and data structures
-    3. Process each sample according to its task type
-    4. Apply filtering, validation, and coordinate normalization
-    5. Save processed samples and comprehensive statistics
+    3. Process each sample according to its task type (in parallel via
+       ``multiprocessing.Pool`` — see :data:`NUM_WORKERS`)
+    4. Renumber colliding worker-local sample IDs into globally unique IDs
+    5. Save processed samples + unified info.json reports
 
     The pipeline ensures data quality through validation, error tracking,
     and structured output organization for different task categories.
@@ -1053,25 +1276,63 @@ def make_multiui_data() -> None:
 
     # Initialize counters and collections for processing tracking
     counters = initialize_processing_counters()
-    caption_samples = []      # UI caption task samples
-    gnd_ref_qa_samples = []   # Grounding, QA, and OCR task samples
-    exception_sample_idxs = []  # Track samples that caused exceptions
+    caption_samples: List[Dict] = []
+    gnd_ref_qa_samples: List[Dict] = []
 
-    # Process all samples through the main processing pipeline
-    exception_sample_idxs = process_all_samples(
+    # Process all samples (parallel by default; see NUM_WORKERS).
+    errors = process_all_samples(
         multiui_data, invalid_ids, counters,
         caption_samples, gnd_ref_qa_samples
     )
 
-    # Prepare comprehensive processing statistics
+    # Workers used local 0-based counters; renumber per-prefix so the global
+    # output has unique, contiguous IDs.
+    renumber_sample_ids(caption_samples)
+    renumber_sample_ids(gnd_ref_qa_samples)
+
+    # Loud end-of-run summary — surfaces mass-failures (e.g., a typo that
+    # crashes every worker invocation) before they get buried in the JSON.
+    print_error_summary(errors, total_tasks=len(multiui_data))
+
+    # Prepare comprehensive processing statistics (kept for backwards-compat
+    # with downstream tooling that reads `stats.json`).
     stats = prepare_processing_statistics(
-        multiui_data, counters, caption_samples, gnd_ref_qa_samples, exception_sample_idxs
+        multiui_data, counters, caption_samples, gnd_ref_qa_samples, errors
     )
 
-    # Save processed samples and statistics to disk
+    # Save processed samples and the legacy stats.json.
     save_processed_data(caption_samples, gnd_ref_qa_samples, stats)
 
-    # Print comprehensive processing summary
+    # Also emit a unified `_info.json` for each output split — same
+    # structured schema used by webui / mobileviews / etc.
+    if gnd_ref_qa_samples:
+        gnd_qa_path = os.path.join(
+            SAVE_ROOT,
+            f'{DATASET_NAME}_gnd_ref_qa_scale{SCALE}_{len(gnd_ref_qa_samples)//1000}k.json'
+        )
+        _write_unified_info(
+            output_path=gnd_qa_path,
+            samples=gnd_ref_qa_samples,
+            counters=counters,
+            total_samples=len(multiui_data),
+            errors=errors,
+            section_name='grounding/QA/OCR',
+        )
+    if caption_samples:
+        caption_path = os.path.join(
+            SAVE_ROOT,
+            f'{DATASET_NAME}_caption_{len(caption_samples)//1000}k.json'
+        )
+        _write_unified_info(
+            output_path=caption_path,
+            samples=caption_samples,
+            counters=counters,
+            total_samples=len(multiui_data),
+            errors=errors,
+            section_name='caption',
+        )
+
+    # Print comprehensive processing summary (legacy plain-text output)
     print_processing_summary(stats)
 
 

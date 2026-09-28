@@ -161,3 +161,6 @@ cython_debug/
 
 /utils/eval_utils/eval_results
 /scripts
+data/
+.vscode/
+test.png

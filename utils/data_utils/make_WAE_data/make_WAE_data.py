@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import glob
 import json
+import multiprocessing as mp
 import os
 import random
 import re
 import shutil
 import sys
+import traceback
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from copy import deepcopy
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Set, Tuple, Optional
 
 import cv2
 import magic
@@ -46,6 +48,27 @@ from utils.data_utils.misc import (  # noqa: F401
     is_pure_color,
     is_valid_string,
 )
+from utils.data_utils.run_info import (
+    TASK_DISPLAY_NAMES,
+    print_error_summary,
+    renumber_sample_ids,
+    save_run_info,
+    summarize_errors,
+)
+
+
+def _wae_canonical_counters(counts: Dict[str, int]) -> Dict[str, int]:
+    """Translate WAE's short counter keys (e.g. 'text_loc', 'icongnd') to the
+    canonical ``<task>_cnt`` form used by ``run_info.save_run_info``."""
+    return {
+        'text_loc_cnt': counts.get('text_loc', 0),
+        'ocr_cnt': counts.get('ocr', 0),
+        'icongnd_cnt': counts.get('icongnd', 0),
+        'iconref_cnt': counts.get('iconref', 0),
+        'elemclass_cnt': counts.get('elemclass', 0),
+        'intentgnd_cnt': counts.get('intentgnd', 0),
+        'widgetlist_cnt': counts.get('widgetlist', 0),
+    }
 
 # Configuration constants
 DATASET_NAME: str = 'WAE'
@@ -56,19 +79,58 @@ TEXTLOC: bool = True
 OCR: bool = True
 ICONGND: bool = True
 ICONREF: bool = True
-ELEMCLASS: bool = True
+ELEMCLASS: bool = False
 INTENTGND: bool = True
 WIDGETLIST: bool = True
 
 # Generation parameters
-PROB_BOX: float = 0.0
-SCALE: int = 100
+PROB_BOX: float = 0.3
+SCALE: int = 1000
 SKIP_CHECKING: bool = False
 CHUNK_SIZE: int = 25 if not DEBUG else 1
 
+# --- Parallelism ---
+# Cap derived from the same lesson as GUIEnv: the overlap-check path runs
+# ``pytesseract.image_to_string`` per ambiguous element, which shells out
+# to the tesseract binary. Past ~32 concurrent workers the subprocess /
+# tempfile pressure becomes the bottleneck and throughput collapses. Set
+# NUM_WORKERS=1 to force the sequential code path.
+NUM_WORKERS: int = min(32, max(1, (os.cpu_count() or 1) - 1))
+
+# Populated by ``_init_worker`` in every Pool child. Holds the flat
+# frozenset of all known-invalid sample identifiers so per-element skip
+# checks stay O(1) instead of scanning every registry bucket per call.
+_WAE_INVALID_IDS_CACHE: frozenset = frozenset()
+
+
+def _init_wae_worker(invalid_ids: frozenset) -> None:
+    """Pool initialiser: install the cumulative skip-list in every worker.
+
+    A single frozenset broadcast at pool creation is far cheaper than
+    re-pickling the (potentially huge) set as part of every task arg.
+    """
+    global _WAE_INVALID_IDS_CACHE
+    _WAE_INVALID_IDS_CACHE = invalid_ids
+
+
+# Bucket names this worker may write to. Mirrors the meta init in
+# ``make_wae_data`` so a worker's local tracker has the right shape.
+_WAE_INVALID_BUCKETS: Tuple[str, ...] = (
+    TOO_SMALL_ELEMENT,
+    INVALID_ELEM_BOX,
+    INVALID_ELEM_CONTENT,
+    BLANK_ELEM,
+    EMPTY_ELEM_TEXT,
+    OVERLY_LENGTHY_ELEM_TEXT,
+    DUPLICATE_ELEMEMNT,
+    OVERSIZED_ELEMENT,
+    EXTREME_ASPECT_RATIO,
+    GHOST_ELEMENT,
+)
+
 # Paths
-WAE_DIR: str = f"/mnt/vdb1/hongxin_li/{DATASET_NAME}/tmp"
-ROOT_DIR: str = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp"
+WAE_DIR: str = f"/volume/pt-coder/users/gji/projects/UIPro/data/{DATASET_NAME}"
+ROOT_DIR: str = "/volume/pt-coder/users/gji/projects/UIPro/data"
 SAVE_IMAGES_TO: str = os.path.join(ROOT_DIR, f"{DATASET_NAME}{'_debug' if DEBUG else ''}")
 SAVE_ROOT: str = os.path.join(ROOT_DIR, f"{DATASET_NAME}_processed")
 CHUNK_DIR: str = os.path.join(SAVE_ROOT, 'chunks')
@@ -206,7 +268,7 @@ def _process_node_for_textloc(
             task_id,
             text=elem_text,
             loc=box_str if with_box else center_str,
-            output_tag=''
+            output_tag=WITHBOX_TAG if with_box else WITHPOINT_TAG
         )
         sample.update({
             'task_attr': elem_text,
@@ -237,7 +299,7 @@ def _process_node_for_ocr(
     if OCR:
         task_id = f'autogui_{DATASET_NAME}_ocr_{counter}'
         loc = box_str if with_box else center_str
-        sample = make_ocr_sample(task_id, text=elem_text, loc=loc, with_box=with_box)
+        sample = make_ocr_sample(task_id, text=elem_text, loc=loc, output_tag=WITHBOX_TAG if with_box else WITHPOINT_TAG)
         sample.update({
             'task_attr': loc,
             'unnormalized_box': unnormalized_box,
@@ -274,7 +336,7 @@ def _process_node_for_icon_tasks(
             task_id,
             icon_desc=node_content_desc,
             loc=box_str if with_box else center_str,
-            output_tag=''
+            output_tag=WITHPOINT_TAG
         )
         sample.update({
             'task_attr': node_content_desc,
@@ -294,7 +356,7 @@ def _process_node_for_icon_tasks(
                 task_id,
                 icon_desc=node_content_desc,
                 loc=loc,
-                with_box=with_box
+                output_tag=WITHBOX_TAG if with_box else WITHPOINT_TAG 
             )
             sample.update({
                 'task_attr': loc,
@@ -341,7 +403,7 @@ def _process_node_for_intentgnd(
                 task_id,
                 intent=intent,
                 loc=box_str if with_box else center_str,
-                output_tag=''
+                output_tag=WITHBOX_TAG if with_box else WITHPOINT_TAG
             )
             sample.update({
                 'task_attr': intent,
@@ -353,6 +415,345 @@ def _process_node_for_intentgnd(
             samples.append(sample)
             return counter + 1
     return counter
+
+
+def _wae_process_trajectory(traj_name: str) -> Dict[str, Any]:
+    """Worker: process every screenshot in one WAE trajectory.
+
+    The per-screenshot validation/sample-generation logic is preserved
+    verbatim from the original sequential loop — including the quirky
+    pytesseract overlap check, the BLANK_ELEM / GHOST_ELEMENT
+    distinctions, and the per-traj ``img`` lazy-load — so the output is
+    bit-for-bit equivalent to the sequential run except for two changes:
+
+      1. Sample task IDs use worker-local counters (collisions across
+         trajectories are renumbered globally by ``renumber_sample_ids``
+         after aggregation).
+      2. The cumulative skip-list lookup is O(1) against the worker-global
+         frozenset ``_WAE_INVALID_IDS_CACHE``, not the original O(N) scan
+         across every registry bucket.
+
+    Returned dict keys (all picklable):
+      - ``traj_name``: echo of the input for ordered checkpoint updates.
+      - ``samples``: list of generated sample dicts.
+      - ``counts``: per-trajectory counter increments (``processed_img_cnt``,
+        ``valid_img_cnt``, ``iterated_elem_cnt``, plus one per task type).
+      - ``invalid_updates``: ``{bucket: [identifier, ...]}`` to union into
+        the cumulative invalid-elem record.
+      - ``unique_elem_entries``: ``{screenshot_path: [unnorm_box, ...]}``
+        for cross-trajectory dedup in the parent.
+      - ``errors``: ``[[traj_name, traceback_str], ...]`` if anything
+        threw — caught locally so a poisonous trajectory never hangs the
+        pool.
+    """
+    samples: List[Dict] = []
+    counts: Dict[str, int] = defaultdict(int)
+    invalid_updates: Dict[str, Set[str]] = {b: set() for b in _WAE_INVALID_BUCKETS}
+    unique_elem_entries: Dict[str, List[List[int]]] = defaultdict(list)
+    errors: List[List[str]] = []
+    last_sample_cnt = 0
+
+    try:
+        screenshot_files = glob.glob(
+            os.path.join(WAE_DIR, traj_name, '*', 'ui', '*.png')
+        )
+        if DEBUG:
+            screenshot_files = screenshot_files[:70]
+
+        for screenshot_file in screenshot_files:
+            screenshot_file = os.path.join(WAE_DIR, screenshot_file)
+            if not os.path.exists(screenshot_file):
+                continue
+
+            vh_file = screenshot_file.replace(".png", ".xml")
+            if not os.path.exists(vh_file):
+                continue
+
+            counts['processed_img_cnt'] += 1
+
+            # Parse XML
+            with open(vh_file, 'r') as f:
+                xml_content = f.read()
+                dom_tree = ET.fromstring(xml_content)
+
+            nodes = find_all_elem_texts_boxes(dom_tree)
+
+            # Detect illegal language types (except English and Chinese)
+            contain_invalid_characters = False
+            for node_idx, node in enumerate(nodes):
+                text = node['text']
+                node['idx'] = node_idx
+                if text is None:
+                    continue
+                if not is_valid_string(text):
+                    contain_invalid_characters = True
+                    break
+
+            num_nodes = len([x for x in nodes if x['is_leaf']])
+            if contain_invalid_characters:
+                counts['iterated_elem_cnt'] += num_nodes
+                continue
+
+            # Image dimensions via libmagic (cheap header read, no decode).
+            hw_info = re.search(r'(\d+) x (\d+)', magic.from_file(screenshot_file))
+            if hw_info is None:
+                counts['iterated_elem_cnt'] += num_nodes
+                continue
+            W, H = list(map(int, hw_info.groups()))
+
+            img = None
+            broken_img = False
+            all_valid_nodes: List[Dict] = []
+
+            # First pass validation
+            for node in nodes:
+                if not node['is_leaf'] or node.get("box", None) is None:
+                    continue
+
+                counts['iterated_elem_cnt'] += 1
+                sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
+
+                # O(1) cumulative skip-list check (was an O(N) scan
+                # across every invalid-elem bucket in the sequential code).
+                if sample_identifier in _WAE_INVALID_IDS_CACHE:
+                    continue
+
+                node["box"] = list(node["box"])
+                if node["box"] not in unique_elem_entries[screenshot_file]:
+                    unique_elem_entries[screenshot_file].append(node["box"])
+
+                if not _validate_node_bounds(
+                    node, W, H, all_valid_nodes, sample_identifier,
+                    invalid_updates,
+                ):
+                    continue
+
+                # Detect successfully displayed nodes (pure colour check).
+                if img is None:
+                    img = cv2.imread(screenshot_file)
+                if img is None:
+                    broken_img = True
+                    break
+
+                x1, y1, x2, y2 = node["box"]
+                if is_pure_color(img, [x1, y1, x2, y2]):
+                    invalid_updates[BLANK_ELEM].add(sample_identifier)
+                    continue
+
+                all_valid_nodes.append(node)
+
+            if broken_img:
+                continue
+
+            # Second pass: overlap check using OCR. This is the heavy
+            # pytesseract call — same workload that capped GUIEnv at 32
+            # workers. We honour the original behaviour exactly.
+            if len(all_valid_nodes) > 1:
+                all_valid_nodes_after_checking_overlap = []
+                for node_idx, node in enumerate(all_valid_nodes):
+                    x1, y1, x2, y2 = node["box"]
+                    sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
+
+                    # Defensive re-check (preserve original behaviour even
+                    # though new local additions are append-only).
+                    if sample_identifier in _WAE_INVALID_IDS_CACHE:
+                        continue
+                    is_invalid = any(
+                        sample_identifier in v for v in invalid_updates.values()
+                    )
+                    if is_invalid:
+                        continue
+
+                    if not SKIP_CHECKING:
+                        other_boxes = [
+                            x['box'] for cur_idx, x in enumerate(all_valid_nodes)
+                            if cur_idx != node_idx
+                        ]
+                        is_overlap = is_box_overlapping_np(
+                            target_box=[x1, y1, x2, y2],
+                            other_boxes=other_boxes, threshold=0.01,
+                        )
+
+                        if is_overlap:
+                            elem_type = classify_node(node)
+                            if elem_type in ['Icon', 'Text']:
+                                elem_text = node.get('text', None)
+                                if elem_text is not None:
+                                    elem_text = elem_text.strip()
+                                    lower_node_text = elem_text.lower()
+                                    elem_text_is_description = any(
+                                        k in lower_node_text
+                                        for k in ['icon', 'button', 'back']
+                                    )
+                                    if not elem_text_is_description:
+                                        roi = img[y1:y2, x1:x2]
+                                        ocr_result = pytesseract.image_to_string(
+                                            cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                                        ).strip()
+                                        similarity_ratio = fuzz.ratio(
+                                            ocr_result, elem_text,
+                                        )
+                                        node['ocr'] = [ocr_result, similarity_ratio]
+                                        if similarity_ratio < 22:
+                                            invalid_updates[GHOST_ELEMENT].add(
+                                                sample_identifier,
+                                            )
+                                            continue
+
+                    all_valid_nodes_after_checking_overlap.append(node)
+                all_valid_nodes = all_valid_nodes_after_checking_overlap
+
+            if not all_valid_nodes:
+                continue
+
+            all_node_texts = [
+                node['text'] for node in all_valid_nodes if 'text' in node
+            ]
+            traj_name_part = screenshot_file.split('/')[-4]
+            package = traj_name_part.split('_')[0]
+            short_img_path = (
+                f'{DATASET_NAME}/' + screenshot_file.split(f'{DATASET_NAME}/')[1]
+            )
+
+            used_boxes: List[List[int]] = []
+            for node in all_valid_nodes:
+                sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
+
+                # Final invalid-check (preserves the original defensive triple-check).
+                if sample_identifier in _WAE_INVALID_IDS_CACHE:
+                    continue
+                if any(sample_identifier in v for v in invalid_updates.values()):
+                    continue
+
+                if not SKIP_CHECKING and node["box"] in used_boxes:
+                    invalid_updates[DUPLICATE_ELEMEMNT].add(sample_identifier)
+                    continue
+                else:
+                    used_boxes.append(node["box"])
+
+                elem_text = node['text']
+                node['node_desc'] = _get_node_description(node)
+
+                x1, y1, x2, y2 = node["box"]
+                box, box_str = _normalize_box(x1, y1, x2, y2, W, H)
+                normalized_center, center_str = _normalize_center(
+                    x1, y1, x2, y2, W, H,
+                )
+                unnormalized_box = [x1, y1, x2, y2]
+                box_w, box_h = x2 - x1, y2 - y1
+                center = [(x1 + x2) // 2, (y1 + y2) // 2]
+
+                # Text Localization & OCR
+                if elem_text is not None and 0 < len(elem_text) <= 200:
+                    elem_text = elem_text.strip()
+                    with_box = random.random() < PROB_BOX
+
+                    if img is None:
+                        img = cv2.imread(screenshot_file)
+                    center_roi = [
+                        max(0, center[0] - box_w // 10),
+                        max(0, center[1] - box_h // 10),
+                        center[0] + box_w // 10,
+                        center[1] + box_h // 10,
+                    ]
+                    if is_pure_color(img, center_roi):
+                        with_box = True
+
+                    counts['text_loc'] = _process_node_for_textloc(
+                        elem_text, all_node_texts, box_str, center_str,
+                        unnormalized_box, short_img_path, package, W, H,
+                        with_box, samples, counts['text_loc'],
+                    )
+                    counts['ocr'] = _process_node_for_ocr(
+                        elem_text, box_str, center_str, unnormalized_box,
+                        short_img_path, package, W, H, with_box,
+                        samples, counts['ocr'],
+                    )
+
+                # Icon Grounding & Reference
+                node_content_desc = node.get('content-desc', None)
+                all_node_content_descs = [
+                    n.get('content-desc') for n in all_valid_nodes
+                    if n.get('content-desc')
+                ]
+
+                if (
+                    (elem_text is None or len(elem_text) == 0)
+                    and node_content_desc
+                    and 0 < len(node_content_desc) <= 200
+                ):
+                    counts['icongnd'], counts['iconref'] = _process_node_for_icon_tasks(
+                        node_content_desc, all_node_content_descs,
+                        box_str, center_str, unnormalized_box,
+                        short_img_path, package, W, H,
+                        samples, counts['icongnd'], counts['iconref'],
+                    )
+
+                # Intent Grounding
+                node_desc = node.get('node_desc', None)
+                all_node_descs = [
+                    n.get('node_desc') for n in all_valid_nodes if n.get('node_desc')
+                ]
+                counts['intentgnd'] = _process_node_for_intentgnd(
+                    node, node_desc, elem_text, all_node_descs, all_node_texts,
+                    box_str, center_str, normalized_center, unnormalized_box,
+                    short_img_path, package, W, H, samples, counts['intentgnd'],
+                )
+
+            # Widget list (per-screen, one sample if ≥2 valid nodes).
+            if WIDGETLIST and len(all_valid_nodes) >= 2:
+                task_id = f'autogui_{DATASET_NAME}_widgetlist_{counts["widgetlist"]}'
+                node_texts_boxes = []
+                for node in all_valid_nodes:
+                    desc = node['node_desc'] if node['node_desc'] else ''
+                    u_box = node['box']
+                    n_box, _ = _normalize_box(u_box[0], u_box[1], u_box[2], u_box[3], W, H)
+                    clean_desc = ' '.join(
+                        x for x in desc.strip(' ,.').split('\n') if x.strip()
+                    )
+                    node_texts_boxes.append((node['tag'], clean_desc, u_box, n_box))
+
+                node_texts_boxes.sort(
+                    key=lambda x: (x[2][1] + x[2][3], x[2][0] + x[2][2]),
+                )
+                elem_list_str = '\n'.join(
+                    f"{i} {nodeclass} '{nodetext}' ({nb[0]},{nb[1]},{nb[2]},{nb[3]})"
+                    for i, (nodeclass, nodetext, _, nb) in enumerate(node_texts_boxes)
+                )
+
+                sample = make_widgetlist_sample(task_id, elem_list=elem_list_str)
+                sample.update({
+                    'task_attr': None,
+                    'image': short_img_path,
+                    'wxh': f"{W}x{H}",
+                    'package': package,
+                    'unnormalized_box': [x[2] for x in node_texts_boxes],
+                })
+                samples.append(sample)
+                counts['widgetlist'] += 1
+
+            if DEBUG:
+                for i in range(last_sample_cnt, len(samples)):
+                    samples[i]['original_img_file'] = screenshot_file
+
+            if len(samples) > last_sample_cnt:
+                counts['valid_img_cnt'] += 1
+            last_sample_cnt = len(samples)
+
+    except Exception:
+        # Catch *everything* — the pool must never see an exception from a
+        # worker, or ``imap_unordered`` can stall waiting for tasks that
+        # never produce a result.
+        errors.append([traj_name, traceback.format_exc()])
+
+    return {
+        'traj_name': traj_name,
+        'samples': samples,
+        'counts': dict(counts),
+        'invalid_updates': {k: list(v) for k, v in invalid_updates.items() if v},
+        'unique_elem_entries': {k: list(v) for k, v in unique_elem_entries.items()},
+        'errors': errors,
+    }
 
 
 def _save_chunk_data(
@@ -367,7 +768,9 @@ def _save_chunk_data(
     """Save the current chunk of processed data."""
     chunk_file = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx}_s{SCALE}{'_debug' if DEBUG else ''}.json")
     
-    print(f"Saving chunk {chunk_idx} with {len(chunk_samples)} samples to {chunk_file}")
+    # Route through tqdm.write so the message never corrupts an active
+    # progress bar (a raw print() to stdout shatters the bar's redraw).
+    tqdm.write(f"Saving chunk {chunk_idx} with {len(chunk_samples)} samples to {chunk_file}")
     
     with open(chunk_file, 'w') as f:
         json.dump(chunk_samples, f)
@@ -381,44 +784,31 @@ def _save_chunk_data(
     with open(ckpt_file, 'w') as f:
         json.dump({'completely_proc_traj_names': completely_proc_traj_names}, f)
 
-    # Generate and save report
+    # Unified per-chunk reporting via run_info.save_run_info.
     num_invalid_elem = sum(len(v) for v in invalid_elem_tracker.values())
-    processed_img_cnt = counts['processed_img_cnt']
-    valid_img_cnt = counts['valid_img_cnt']
-    iterated_elem_cnt = counts['iterated_elem_cnt']
-
-    valid_ratio = valid_img_cnt / processed_img_cnt if processed_img_cnt > 0 else 0.0
-    invalid_ratio = num_invalid_elem / iterated_elem_cnt if iterated_elem_cnt > 0 else 0.0
-
-    report = (
-        f"Valid image ratio: {valid_img_cnt} / {processed_img_cnt} = {valid_ratio:.2f}\n"
-        f"Invalid elem ratio: {num_invalid_elem} / {iterated_elem_cnt} = {invalid_ratio:.2f}\n"
-        f"text_loc: {counts['text_loc']} | ocr: {counts['ocr']} | "
-        f"icongnd: {counts['icongnd']} | iconref: {counts['iconref']} | "
-        f"elemclass: {counts['elemclass']} | intentgnd: {counts['intentgnd']} | "
-        f"widgetlist: {counts['widgetlist']}"
+    save_run_info(
+        dataset=f"{DATASET_NAME} (chunk {chunk_idx})",
+        output_path=chunk_file,
+        samples=chunk_samples,
+        counters=_wae_canonical_counters(counts),
+        config={'debug': DEBUG, 'scale': SCALE, 'chunk_idx': chunk_idx},
+        images={
+            'processed': counts['processed_img_cnt'],
+            'valid': counts['valid_img_cnt'],
+        },
+        elements={
+            'iterated': counts['iterated_elem_cnt'],
+            'invalid': num_invalid_elem,
+            'invalid_breakdown': {
+                k: len(v) for k, v in invalid_elem_tracker.items()
+            },
+        },
+        write_preview=False,
+        # Per-chunk: persist the chunk's info.json for resumability/aggregation
+        # but don't print a report block — only the final aggregated run prints
+        # (mirrors make_webui_data.py, which calls save_run_info once at the end).
+        print_report=False,
     )
-    print(report)
-
-    # Save info file
-    info_data = {
-        'num_samples': len(chunk_samples),
-        'valid_img_cnt': valid_img_cnt,
-        'processed_img_cnt': processed_img_cnt,
-        'num_invalid_elements': num_invalid_elem,
-        'iterated_elem_cnt': iterated_elem_cnt,
-        'text_loc_cnt': counts['text_loc'],
-        'ocr_cnt': counts['ocr'],
-        'icongnd_cnt': counts['icongnd'],
-        'iconref_cnt': counts['iconref'],
-        'elemclass_cnt': counts['elemclass'],
-        'intentgnd_cnt': counts['intentgnd'],
-        'widgetlist_cnt': counts['widgetlist'],
-        'report': report,
-        'invalid_elem_types': {k: len(v) for k, v in invalid_elem_tracker.items()}
-    }
-    with open(chunk_file.replace('.json', '_info.json'), "w") as f:
-        json.dump(info_data, f, indent=2)
 
 
 def make_wae_data() -> None:
@@ -439,7 +829,7 @@ def make_wae_data() -> None:
     # Get trajectories
     all_traj_names = sorted(os.listdir(WAE_DIR))
     if DEBUG:
-        all_traj_names = all_traj_names[:50]
+        all_traj_names = all_traj_names[:100]
 
     # Initialize counters and trackers
     counts = defaultdict(int)
@@ -460,400 +850,239 @@ def make_wae_data() -> None:
     # Note: This logic is slightly simplified from original to assume start fresh or from last chunk
     invalid_elem_tracker = deepcopy(invalid_elem_meta)
 
-    # Processing Loop
-    for traj_idx, traj_name in tqdm(enumerate(all_traj_names), total=len(all_traj_names), desc="Processing trajectories"):
-        if traj_name in completely_proc_traj_names:
-            continue
-        
-        chunk_traj_names.append(traj_name)
-        screenshot_files = glob.glob(os.path.join(WAE_DIR, traj_name, '*', 'ui', '*.png'))
+    # ------------------------------------------------------------------
+    # Parallel per-trajectory dispatch — the per-screenshot logic the
+    # original loop ran sequentially is now in ``_wae_process_trajectory``.
+    # Behavioural notes:
+    #   - Trajectories already listed in ``completely_proc_traj_names``
+    #     are skipped (original RESUME semantics).
+    #   - Chunks are flushed every ``CHUNK_SIZE`` *completed* trajectories,
+    #     not every ``CHUNK_SIZE`` trajectories on the input list — with
+    #     parallel processing the completion order is non-deterministic,
+    #     and what matters for the saved chunk files is the unit of work,
+    #     not the source ordering.
+    #   - Task IDs are worker-local (collisions across trajectories within
+    #     one chunk are possible). The final aggregator
+    #     :func:`_aggregate_and_save_final_results` calls
+    #     ``renumber_sample_ids`` on the full output to give every sample
+    #     a globally unique id.
+    #   - The cumulative invalid-elem skip-list is broadcast to every
+    #     worker as a frozenset via ``_init_wae_worker`` — O(1) per-elem
+    #     lookups instead of the original O(N) scan over registry buckets.
+    # ------------------------------------------------------------------
+    work_items = [t for t in all_traj_names if t not in completely_proc_traj_names]
+    errors: List[List[str]] = []
 
-        if DEBUG:
-            screenshot_files = screenshot_files[:70]
+    # Build the read-only skip-list snapshot before pool creation. New
+    # invalid IDs found by workers are merged into ``invalid_elem_tracker``
+    # in the parent — they don't propagate back to other workers in the
+    # same chunk, but the chunk's saved record captures them all.
+    def _refresh_invalid_ids_frozen() -> frozenset:
+        return frozenset(
+            sid for bucket in invalid_elem_tracker.values() for sid in bucket
+        )
 
-        for screenshot_file in screenshot_files:
-            screenshot_file = os.path.join(WAE_DIR, screenshot_file)
-            if not os.path.exists(screenshot_file):
-                continue
+    chunk_idx_counter = 0
 
-            vh_file = screenshot_file.replace(".png", ".xml")
-            if not os.path.exists(vh_file):
-                continue
+    def _flush_chunk_if_due(force: bool = False) -> None:
+        """Flush the current chunk to disk if we've hit ``CHUNK_SIZE`` or
+        the caller marks the run as done. Preserves the original chunk
+        cadence and the "reset everything per chunk" semantics (the chunk
+        info JSON is per-chunk, not cumulative)."""
+        nonlocal chunk_idx_counter, invalid_elem_tracker, last_sample_cnt
+        if not chunk_traj_names:
+            return
+        if not force and len(chunk_traj_names) < CHUNK_SIZE:
+            return
 
-            counts['processed_img_cnt'] += 1
+        chunk_idx_counter += 1
+        _save_chunk_data(
+            chunk_idx_counter, chunk_samples, invalid_elem_tracker, counts,
+            chunk_traj_names, completely_proc_traj_names, ckpt_file,
+        )
 
-            # Parse XML
-            with open(vh_file, 'r') as f:
-                xml_content = f.read()
-                dom_tree = ET.fromstring(xml_content)
-            
-            nodes = find_all_elem_texts_boxes(dom_tree)
+        # Reset per-chunk counters (matches the original sequential
+        # behaviour at line ~1137 — task counters reset so each chunk's
+        # info.json reports its own slice, not the cumulative roll-up).
+        counts['processed_img_cnt'] = 0
+        counts['valid_img_cnt'] = 0
+        counts['iterated_elem_cnt'] = 0
+        for key in ['text_loc', 'ocr', 'icongnd', 'iconref',
+                    'elemclass', 'intentgnd', 'widgetlist']:
+            counts[key] = 0
+        last_sample_cnt = 0
+        chunk_samples.clear()
+        chunk_traj_names.clear()
 
-            # Detect illegal language types (except English and Chinese)
-            contain_invalid_characters = False
-            for node_idx, node in enumerate(nodes):
-                text = node['text']
-                node['idx'] = node_idx
-                if text is None: continue
-                if not is_valid_string(text):
-                    contain_invalid_characters = True
-                    break
-            
-            num_nodes = len([x for x in nodes if x['is_leaf']])
-            if contain_invalid_characters:
-                counts['iterated_elem_cnt'] += num_nodes
-                continue
+        # Resumability: same hook as the original — if a previous run
+        # already wrote ``chunk_{N+1}_invalid_elems.json`` we adopt it.
+        next_invalid_file = os.path.join(
+            CHUNK_DIR, f'chunk_{chunk_idx_counter + 1}_invalid_elems.json',
+        )
+        if os.path.exists(next_invalid_file):
+            with open(next_invalid_file, 'r') as f:
+                loaded = json.load(f)
+            invalid_elem_tracker = {k: set(v) for k, v in loaded.items()}
+        else:
+            invalid_elem_tracker = deepcopy(invalid_elem_meta)
 
-            # Get image dimensions
-            # Since the maximum UI resolution in this dataset is 1280, no resizing is performed.
-            hw_info = re.search(r'(\d+) x (\d+)', magic.from_file(screenshot_file))
-            if hw_info is None:
-                counts['iterated_elem_cnt'] += num_nodes
-                continue
-            W, H = list(map(int, hw_info.groups()))
-            
-            img = None
-            broken_img = False
-            all_valid_nodes = []
+    def _aggregate_result(result: Dict[str, Any]) -> None:
+        """Merge one worker result into the in-flight chunk."""
+        nonlocal last_sample_cnt
+        chunk_samples.extend(result['samples'])
+        for k, v in result['counts'].items():
+            counts[k] += v
+        for bucket, ids in result['invalid_updates'].items():
+            invalid_elem_tracker.setdefault(bucket, set()).update(ids)
+        for img, boxes in result['unique_elem_entries'].items():
+            existing = unique_elems[img]
+            for b in boxes:
+                if b not in existing:
+                    existing.append(b)
+        chunk_traj_names.append(result['traj_name'])
+        last_sample_cnt = len(chunk_samples)
+        errors.extend(result['errors'])
 
-            # First pass validation
-            for node in nodes:
-                if not node['is_leaf'] or node.get("box", None) is None:
-                    continue
-                
-                counts['iterated_elem_cnt'] += 1
-                
-                # Construct unique identifier for invalid checking
-                sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
-                
-                # Check if already marked invalid in previous runs
-                is_invalid = False
-                for v in invalid_elem_tracker.values():
-                    if sample_identifier in v:
-                        is_invalid = True
-                        break
-                if is_invalid:
-                    continue
+    use_parallel = NUM_WORKERS > 1 and len(work_items) > 1
+    print(
+        f"Processing {len(work_items)} trajectories "
+        f"{'in parallel across ' + str(NUM_WORKERS) + ' workers' if use_parallel else 'sequentially'} ..."
+    )
 
-                node["box"] = list(node["box"]) # Ensure list
-                if node["box"] not in unique_elems[screenshot_file]:
-                    unique_elems[screenshot_file].append(node["box"])
-
-                if not _validate_node_bounds(node, W, H, all_valid_nodes, sample_identifier, invalid_elem_tracker):
-                    continue
-
-                # Detect successfully displayed nodes (pure color check)
-                if img is None:
-                    img = cv2.imread(screenshot_file)
-                if img is None:
-                    broken_img = True
-                    break
-                
-                x1, y1, x2, y2 = node["box"]
-                if is_pure_color(img, [x1, y1, x2, y2]):
-                    invalid_elem_tracker[BLANK_ELEM].add(sample_identifier)
-                    continue
-
-                all_valid_nodes.append(node)
-
-            if broken_img:
-                continue
-
-            # Second pass: Overlap checking with OCR
-            # Compare OCR results with element text attributes to remove invalid elements
-            # where the box covers other elements.
-            if len(all_valid_nodes) > 1:
-                all_valid_nodes_after_checking_overlap = []
-                for node_idx, node in enumerate(all_valid_nodes):
-                    x1, y1, x2, y2 = node["box"]
-                    sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
-                    
-                    # Re-check invalidity (defensive)
-                    is_invalid = False
-                    for v in invalid_elem_tracker.values():
-                        if sample_identifier in v:
-                            is_invalid = True
-                            break
-                    if is_invalid:
-                        continue
-
-                    if not SKIP_CHECKING:
-                        other_boxes = [x['box'] for cur_idx, x in enumerate(all_valid_nodes) if cur_idx != node_idx]
-                        is_overlap = is_box_overlapping_np(target_box=[x1, y1, x2, y2], other_boxes=other_boxes, threshold=0.01)
-
-                        if is_overlap:
-                            elem_type = classify_node(node)
-                            if elem_type in ['Icon', 'Text']:
-                                elem_text = node.get('text', None)
-                                if elem_text is not None:
-                                    elem_text = elem_text.strip()
-                                    lower_node_text = elem_text.lower()
-                                    elem_text_is_description = any(k in lower_node_text for k in ['icon', 'button', 'back'])
-                                    
-                                    if not elem_text_is_description:
-                                        roi = img[y1:y2, x1:x2]
-                                        ocr_result = pytesseract.image_to_string(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)).strip()
-                                        similarity_ratio = fuzz.ratio(ocr_result, elem_text)
-                                        node['ocr'] = [ocr_result, similarity_ratio]
-                                        
-                                        if similarity_ratio < 22:
-                                            invalid_elem_tracker[GHOST_ELEMENT].add(sample_identifier)
-                                            continue
-                    
-                    all_valid_nodes_after_checking_overlap.append(node)
-                all_valid_nodes = all_valid_nodes_after_checking_overlap
-
-            if not all_valid_nodes:
-                continue
-
-            # Prepare data for task generation
-            all_node_texts = [node['text'] for node in all_valid_nodes if 'text' in node]
-            
-            # Extract package name
-            # example: .../com.twansoftware.pdfconverterpro_6000006-output/stoat_fsm_output/ui/S_1.png
-            traj_name_part = screenshot_file.split('/')[-4]
-            package = traj_name_part.split('_')[0]
-            
-            short_img_path = f'{DATASET_NAME}/' + screenshot_file.split(f'{DATASET_NAME}/tmp/')[1]
-            
-            # Process nodes for individual tasks
-            used_boxes = []
-            
-            for node in all_valid_nodes:
-                sample_identifier = f"{screenshot_file}|{node['idx']}|{node['box']}"
-                
-                # Final invalid check
-                is_invalid = False
-                for v in invalid_elem_tracker.values():
-                    if sample_identifier in v:
-                        is_invalid = True
-                        break
-                if is_invalid:
-                    continue
-
-                # Skip overlapping boxes
-                if not SKIP_CHECKING and node["box"] in used_boxes:
-                    invalid_elem_tracker[DUPLICATE_ELEMEMNT].add(sample_identifier) # Note: original script counted integer here, but set expected
-                    continue
-                else:
-                    used_boxes.append(node["box"])
-
-                # Prepare node attributes
-                elem_text = node['text']
-                node['node_desc'] = _get_node_description(node)
-                
-                x1, y1, x2, y2 = node["box"]
-                box, box_str = _normalize_box(x1, y1, x2, y2, W, H)
-                normalized_center, center_str = _normalize_center(x1, y1, x2, y2, W, H)
-                unnormalized_box = [x1, y1, x2, y2]
-                box_w, box_h = x2 - x1, y2 - y1
-                center = [(x1 + x2) // 2, (y1 + y2) // 2]
-
-                # Text Localization & OCR
-                if elem_text is not None and 0 < len(elem_text) <= 200:
-                    elem_text = elem_text.strip()
-                    with_box = random.random() < PROB_BOX
-                    
-                    # If the element text does not populate the whole box, use the box as reference
-                    if img is None: img = cv2.imread(screenshot_file)
-                    center_roi = [
-                        max(0, center[0] - box_w // 10),
-                        max(0, center[1] - box_h // 10),
-                        center[0] + box_w // 10,
-                        center[1] + box_h // 10
-                    ]
-                    if is_pure_color(img, center_roi):
-                        with_box = True
-
-                    counts['text_loc'] = _process_node_for_textloc(
-                        elem_text, all_node_texts, box_str, center_str, unnormalized_box,
-                        short_img_path, package, W, H, with_box, chunk_samples, counts['text_loc']
-                    )
-
-                    counts['ocr'] = _process_node_for_ocr(
-                        elem_text, box_str, center_str, unnormalized_box,
-                        short_img_path, package, W, H, with_box, chunk_samples, counts['ocr']
-                    )
-
-                # Icon Grounding & Reference
-                node_content_desc = node.get('content-desc', None)
-                all_node_content_descs = [n.get('content-desc') for n in all_valid_nodes if n.get('content-desc')]
-                
-                if (elem_text is None or len(elem_text) == 0) and node_content_desc and 0 < len(node_content_desc) <= 200:
-                    counts['icongnd'], counts['iconref'] = _process_node_for_icon_tasks(
-                        node_content_desc, all_node_content_descs, box_str, center_str,
-                        unnormalized_box, short_img_path, package, W, H, chunk_samples,
-                        counts['icongnd'], counts['iconref']
-                    )
-
-                # Intent Grounding
-                node_desc = node.get('node_desc', None)
-                all_node_descs = [n.get('node_desc') for n in all_valid_nodes if n.get('node_desc')]
-                
-                counts['intentgnd'] = _process_node_for_intentgnd(
-                    node, node_desc, elem_text, all_node_descs, all_node_texts,
-                    box_str, center_str, normalized_center, unnormalized_box,
-                    short_img_path, package, W, H, chunk_samples, counts['intentgnd']
-                )
-
-            # Widget List
-            if WIDGETLIST and len(all_valid_nodes) >= 2:
-                task_id = f'autogui_{DATASET_NAME}_widgetlist_{counts["widgetlist"]}'
-                node_texts_boxes = []
-                for node in all_valid_nodes:
-                    desc = node['node_desc'] if node['node_desc'] else ''
-                    u_box = node['box']
-                    n_box, _ = _normalize_box(u_box[0], u_box[1], u_box[2], u_box[3], W, H)
-                    
-                    clean_desc = ' '.join(x for x in desc.strip(' ,.').split('\n') if x.strip())
-                    node_texts_boxes.append((node['tag'], clean_desc, u_box, n_box))
-                
-                # Sort by position: top-to-bottom, left-to-right
-                node_texts_boxes.sort(key=lambda x: (x[2][1] + x[2][3], x[2][0] + x[2][2]))
-                
-                elem_list_str = '\n'.join(
-                    f"{i} {nodeclass} '{nodetext}' ({nb[0]},{nb[1]},{nb[2]},{nb[3]})"
-                    for i, (nodeclass, nodetext, _, nb) in enumerate(node_texts_boxes)
-                )
-                
-                sample = make_widgetlist_sample(task_id, elem_list=elem_list_str)
-                sample.update({
-                    'task_attr': None,
-                    'image': short_img_path,
-                    'wxh': f"{W}x{H}",
-                    'package': package,
-                    'unnormalized_box': [x[2] for x in node_texts_boxes]
-                })
-                chunk_samples.append(sample)
-                counts['widgetlist'] += 1
-
-            # Update image validity stats
-            if DEBUG:
-                for i in range(last_sample_cnt, len(chunk_samples)):
-                    chunk_samples[i]['original_img_file'] = screenshot_file
-
-            if len(chunk_samples) > last_sample_cnt:
-                counts['valid_img_cnt'] += 1
-            last_sample_cnt = len(chunk_samples)
-
-        # Chunk Saving Logic
-        if traj_idx > 0 and (traj_idx % CHUNK_SIZE == 0 or traj_idx == len(all_traj_names) - 1):
-            chunk_idx = traj_idx // CHUNK_SIZE
-            _save_chunk_data(
-                chunk_idx, chunk_samples, invalid_elem_tracker, counts,
-                chunk_traj_names, completely_proc_traj_names, ckpt_file
+    if not work_items:
+        print("Nothing to process (all trajectories already complete in checkpoint).")
+    elif use_parallel:
+        # chunksize=1 here: each task is one whole trajectory (already a
+        # batch of many screenshots), so per-task IPC overhead is small
+        # relative to processing time. Keeping chunksize=1 also bounds
+        # the work lost if a worker dies mid-chunk.
+        with mp.Pool(
+            processes=NUM_WORKERS,
+            initializer=_init_wae_worker,
+            initargs=(_refresh_invalid_ids_frozen(),),
+            # Recycle workers periodically — pytesseract leaves /tmp
+            # artifacts behind, and long-lived workers grow their heap
+            # holding image buffers. 100 trajectories per worker is a
+            # reasonable balance.
+            maxtasksperchild=100,
+        ) as pool:
+            pbar = tqdm(
+                pool.imap_unordered(_wae_process_trajectory, work_items, chunksize=1),
+                total=len(work_items),
+                desc=f'WAE ×{NUM_WORKERS}',
+                unit='traj',
+                smoothing=0.05,
+                dynamic_ncols=True,
+                mininterval=0.3,
             )
-            
-            # Reset for next chunk
-            # Note: The original script reset specific counters here but accumulated total invalid element counts
-            # via file loading/saving. Here we keep the counters running in `counts` but `chunk_samples` clears.
-            # The original script's behavior of resetting *all* counters (processed_img_cnt etc) every chunk 
-            # suggests the report is per-chunk.
-            
-            counts['processed_img_cnt'] = 0
-            counts['valid_img_cnt'] = 0
-            counts['iterated_elem_cnt'] = 0
-            # Reset task counters as well to match original logic?
-            # Original script resets them: text_loc_cnt = ... = 0
-            # But it passes them into task generation. This implies task IDs might overlap between chunks 
-            # if we reset to 0? 
-            # Looking at original: `task_id = f'autogui_{DATASET_NAME}_textloc_{text_loc_cnt}'`
-            # If we reset `text_loc_cnt` to 0, we get duplicate IDs across chunks.
-            # However, the original script *does* reset them (line 492). 
-            # This implies task IDs are unique only within a chunk or the user doesn't care about global uniqueness.
-            # I will follow the original logic and reset them.
-            for key in ['text_loc', 'ocr', 'icongnd', 'iconref', 'elemclass', 'intentgnd', 'widgetlist']:
-                counts[key] = 0
-            
-            last_sample_cnt = 0
-            chunk_samples.clear()
-            chunk_traj_names.clear()
+            for result in pbar:
+                _aggregate_result(result)
+                _flush_chunk_if_due()
+    else:
+        # Sequential fallback also needs the worker global installed so
+        # the in-worker O(1) skip check works in-process.
+        _init_wae_worker(_refresh_invalid_ids_frozen())
+        for traj_name in tqdm(work_items, total=len(work_items), desc='WAE'):
+            _aggregate_result(_wae_process_trajectory(traj_name))
+            _flush_chunk_if_due()
 
-            # Handle invalid elem tracker persistence for next chunk
-            # The original script loads the *next* chunk's invalid elem file if it exists, else deepcopies meta.
-            # This implies a pre-computation or multi-pass approach where we might resume.
-            next_invalid_file = os.path.join(CHUNK_DIR, f'chunk_{chunk_idx+1}_invalid_elems.json')
-            if os.path.exists(next_invalid_file):
-                with open(next_invalid_file, 'r') as f:
-                    loaded = json.load(f)
-                invalid_elem_tracker = {k: set(v) for k, v in loaded.items()}
-            else:
-                invalid_elem_tracker = deepcopy(invalid_elem_meta)
+    # Force-flush whatever is left in the in-flight chunk.
+    _flush_chunk_if_due(force=True)
 
-    # Final Aggregation
+    # Loud end-of-run summary — surfaces mass failures (poison trajectory,
+    # missing tesseract, bad XML) before the aggregator buries them.
+    print_error_summary(errors, total_tasks=len(work_items))
+
+    # Final aggregation (reads all chunk info.json files, writes the
+    # combined samples + info.json).
     _aggregate_and_save_final_results(unique_elems)
 
 
 def _aggregate_and_save_final_results(unique_elems: Dict[str, List]) -> None:
-    """Aggregate all chunk results and save the final dataset."""
-    all_samples = []
-    all_chunks_num_invalid_elem = defaultdict(int)
-    
-    # Aggregated counters
-    agg_counts = defaultdict(int)
-    
-    chunk_info_files = glob.glob(os.path.join(CHUNK_DIR, f'*_s{SCALE}{"_debug" if DEBUG else ""}_info.json'))
-    
+    """Aggregate all chunk results and save the final dataset.
+
+    Reads each chunk's unified info.json (written via run_info.save_run_info)
+    and rebuilds canonical counters / element stats for a final unified
+    info.json over the whole dataset.
+    """
+    all_samples: List[Dict] = []
+    all_chunks_num_invalid_elem: Dict[str, int] = defaultdict(int)
+    agg_counters: Dict[str, int] = defaultdict(int)
+    agg_processed_img = 0
+    agg_valid_img = 0
+    agg_iterated_elem = 0
+
+    # CamelCase task name -> canonical counter key for write-back.
+    display_to_key = {v: k for k, v in TASK_DISPLAY_NAMES.items()}
+
+    chunk_info_files = glob.glob(
+        os.path.join(CHUNK_DIR, f'*_s{SCALE}{"_debug" if DEBUG else ""}_info.json')
+    )
+
     for chunk_info_file in chunk_info_files:
         chunk_file = chunk_info_file.replace("_info", "")
         with open(chunk_file, 'r') as f:
-            samples = json.load(f)
-            all_samples.extend(samples)
+            all_samples.extend(json.load(f))
 
         with open(chunk_info_file, 'r') as f:
             info = json.load(f)
-            agg_counts['processed_img_cnt'] += info['processed_img_cnt']
-            agg_counts['valid_img_cnt'] += info['valid_img_cnt']
-            agg_counts['iterated_elem_cnt'] += info['iterated_elem_cnt']
-            agg_counts['text_loc'] += info['text_loc_cnt']
-            agg_counts['ocr'] += info['ocr_cnt']
-            agg_counts['icongnd'] += info['icongnd_cnt']
-            agg_counts['iconref'] += info['iconref_cnt']
-            agg_counts['elemclass'] += info['elemclass_cnt']
-            agg_counts['intentgnd'] += info['intentgnd_cnt']
-            agg_counts['widgetlist'] += info['widgetlist_cnt']
-            
-            for k, v in info['invalid_elem_types'].items():
-                all_chunks_num_invalid_elem[k] += v
+
+        images = info.get('images', {})
+        elements = info.get('elements', {})
+        agg_processed_img += images.get('processed', 0)
+        agg_valid_img += images.get('valid', 0)
+        agg_iterated_elem += elements.get('iterated', 0)
+
+        for display_name, count in info.get('samples', {}).get('by_task', {}).items():
+            key = display_to_key.get(display_name)
+            if key is not None:
+                agg_counters[key] += count
+
+        for k, v in elements.get('invalid_breakdown', {}).items():
+            all_chunks_num_invalid_elem[k] += v
 
     all_invalid_elem = sum(all_chunks_num_invalid_elem.values())
     num_unique_elems = sum(len(v) for v in unique_elems.values())
     num_valid_imgs = len([k for k, v in unique_elems.items() if len(v)])
 
-    report = {
-        'num_samples': len(all_samples),
-        '#valid_unique_images': num_valid_imgs,
-        '#all_unique_images': len(unique_elems),
-        'Valid image ratio': f"{agg_counts['valid_img_cnt']} / {agg_counts['processed_img_cnt']} = "
-                             f"{agg_counts['valid_img_cnt']/agg_counts['processed_img_cnt']:.2f}",
-        'processed_img_cnt': agg_counts['processed_img_cnt'],
-        '#num_unique_elems': num_unique_elems,
-        'iterated_elem_cnt': agg_counts['iterated_elem_cnt'],
-        'num_invalid_elements': all_invalid_elem,
-        'Invalid elem ratio': f"{all_invalid_elem} / {agg_counts['iterated_elem_cnt']} = "
-                              f"{all_invalid_elem/agg_counts['iterated_elem_cnt']:.2f}",
-        'text_loc_cnt': agg_counts['text_loc'],
-        'ocr_cnt': agg_counts['ocr'],
-        'icongnd_cnt': agg_counts['icongnd'],
-        'iconref_cnt': agg_counts['iconref'],
-        'elemclass_cnt': agg_counts['elemclass'],
-        'intentgnd_cnt': agg_counts['intentgnd'],
-        'widgetlist_cnt': agg_counts['widgetlist'],
-        'invalid_elem_types': dict(all_chunks_num_invalid_elem)
-    }
-
-    print(json.dumps(report, indent=2))
-
     os.makedirs(SAVE_ROOT, exist_ok=True)
-    file_name = os.path.join(SAVE_ROOT, f"{DATASET_NAME}_scale{SCALE}_{len(all_samples)// 1000}k{'_debug' if DEBUG else ''}.json")
+    file_name = os.path.join(
+        SAVE_ROOT,
+        f"{DATASET_NAME}_scale{SCALE}_{len(all_samples)// 1000}k"
+        f"{'_debug' if DEBUG else ''}.json"
+    )
     print(f"Saving {len(all_samples)} samples to {file_name}")
 
-    with open(file_name.replace('.json', '_info.json'), "w") as f:
-        json.dump(report, f, indent=2)
+    # Workers used per-trajectory local counters for task IDs, so the
+    # aggregated ``all_samples`` may have duplicates like
+    # ``autogui_WAE_textloc_0`` from multiple workers. Renumber globally
+    # per-prefix so the final dataset has unique, contiguous IDs.
+    renumber_sample_ids(all_samples)
 
-    with open(file_name.replace(".json", "_sample.json"), 'w') as f:
-        json.dump(random.sample(all_samples, min(len(all_samples), 128)), f, indent=2)
-    
+    save_run_info(
+        dataset=DATASET_NAME,
+        output_path=file_name,
+        samples=all_samples,
+        counters=dict(agg_counters),
+        config={
+            'debug': DEBUG, 'scale': SCALE,
+            'num_chunks': len(chunk_info_files),
+            'num_workers': NUM_WORKERS,
+        },
+        images={
+            'processed': agg_processed_img,
+            'valid': agg_valid_img,
+            'unique_seen': len(unique_elems),
+            'unique_valid': num_valid_imgs,
+        },
+        elements={
+            'iterated': agg_iterated_elem,
+            'invalid': all_invalid_elem,
+            'unique': num_unique_elems,
+            'invalid_breakdown': dict(all_chunks_num_invalid_elem),
+        },
+    )
+
     with open(file_name, 'w') as f:
         json.dump(all_samples, f)
 

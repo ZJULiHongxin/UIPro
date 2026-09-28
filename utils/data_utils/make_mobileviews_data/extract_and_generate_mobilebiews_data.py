@@ -11,11 +11,13 @@ elements, and generates normalized coordinates for training.
 """
 from __future__ import annotations
 import json
+import multiprocessing as mp
 import os
 import random
 import sys
-from collections import defaultdict
-from typing import Dict, List, Tuple
+import traceback
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
 import pandas as pd
@@ -32,12 +34,26 @@ from misc import (  # noqa: F401
     is_pure_color,
     is_valid_string,
 )
+from run_info import (  # noqa: E402
+    TASK_DISPLAY_NAMES,
+    print_error_summary,
+    renumber_sample_ids,
+    save_run_info,
+    summarize_errors,
+)
 
 # Configuration constants
-DATASET_NAME: str = 'mobileviews'
+DATASET_NAME: str = 'MobileViews'
 DEBUG: bool = False # If True, only process the first 3 samples for each dataset part.
 SCALE: int = 1000 # The scale of coordinates.
 PROB_BOX: float = 0.3 # The probability of generating a box sample.
+
+# Parallelism: 1 forces the sequential code path (also implied when pytesseract
+# is unavailable or for visual debugging). Each worker shells out to the
+# `tesseract` binary in _filter_overlapping_elements, so high NUM_WORKERS
+# multiplies subprocess load — tune down (e.g. 16-32) if the system feels
+# thrashed.
+NUM_WORKERS: int = max(1, (os.cpu_count() or 1) - 1)
 
 # Task flags - enable/disable specific task generation
 TEXTLOC: bool = True # Whether to generate text localization samples.
@@ -47,8 +63,8 @@ INTENTGND: bool = True # Whether to generate intent grounding samples.
 WIDGETLIST: bool = True # Whether to generate widget list samples.
 
 # Paths
-MOBILEVIEWS_DIR: str = "/mnt/vdb1/hongxin_li/MobileViews/" # The directory of MobileViews dataset.
-ROOT: str = "/mnt/nvme0n1p1/hongxin_li/UI_training_data/scaling_exp"
+MOBILEVIEWS_DIR: str = "/volume/pt-coder/users/gji/projects/UIPro/data/MobileViews/" # The directory of MobileViews dataset.
+ROOT: str = "/volume/pt-coder/users/gji/projects/UIPro/data"
 
 # Invalid sample IDs to skip (noise samples)
 INVALID_SAMPLE_IDS: List[int] = [100547, 100625]
@@ -62,6 +78,7 @@ DATASET_PARTS: List[str] = [
 ]
 
 
+
 def _load_screenshot_vh_mapping() -> Dict[str, str]:
     """Load mapping from screenshot files to view hierarchy files.
 
@@ -70,7 +87,7 @@ def _load_screenshot_vh_mapping() -> Dict[str, str]:
     """
     mapping = {}
     for part in DATASET_PARTS:
-        csv_path = os.path.join(MOBILEVIEWS_DIR, f'{part}.csv')
+        csv_path = os.path.join(MOBILEVIEWS_DIR, f'{part.replace("MobileViews", "MobileViews_index")}.csv')
         if not os.path.exists(csv_path):
             continue
         df = pd.read_csv(csv_path)
@@ -577,90 +594,90 @@ def _process_screen_for_widgetlist(
     return widgetlist_cnt + 1, 1
 
 
-def make_mobileviews_data() -> None:
-    """Generate MobileViews training samples and write them to disk.
+# ---------------------------------------------------------------------------
+# Parallel-processing worker
+# ---------------------------------------------------------------------------
+def _process_one_screenshot(item: Tuple[str, str]) -> Dict[str, Any]:
+    """Worker: process one (screenshot, view-hierarchy) pair and return deltas.
 
-    Iterates through all screenshot/view-hierarchy pairs, validates UI elements,
-    filters invalid nodes, and generates samples for enabled tasks. Outputs summary
-    statistics and a small random subset for quick inspection.
+    The function is side-effect free with respect to the parent process —
+    all mutation happens against local containers and only the aggregated
+    deltas are returned. Any exception raised during processing is caught
+    locally and emitted in ``errors`` so a poisonous input never crashes
+    the pool (which would otherwise hang ``imap_unordered``).
+
+    Returned dict keys:
+      - ``samples``: list of generated samples (with worker-local task IDs).
+      - ``counters``: per-task local counts (canonical ``<task>_cnt`` keys).
+      - ``elem_type_cnt`` / ``package_cnt``: aux ``{key: int}`` tallies.
+      - ``node_invalid_types``: ``{reason: int}`` for the invalid-elements report.
+      - ``per_part_stats``: ``{part_name: {images_seen, images_valid, samples}}``.
+      - ``processed`` / ``valid`` / ``iterated``: per-item integer tallies.
+      - ``errors``: ``[[path, traceback_str], ...]`` (empty on success).
     """
-    save_images_to = os.path.join(ROOT, f"{DATASET_NAME}{'_debug' if DEBUG else ''}")
-    os.makedirs(save_images_to, exist_ok=True)
+    screenshot_rel_path, vh_rel_path = item
+    samples: List[Dict] = []
+    counters: Dict[str, int] = defaultdict(int)
+    elem_type_cnt: Dict[str, int] = defaultdict(int)
+    package_cnt: Dict[str, int] = defaultdict(int)
+    node_invalid_types: Dict[str, int] = defaultdict(int)
+    per_part_stats: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {'images_seen': 0, 'images_valid': 0, 'samples': 0}
+    )
+    errors: List[List[str]] = []
+    processed = 0
+    valid = 0
+    iterated = 0
 
-    # Load screenshot to view hierarchy mapping
-    mv_screenshot_vh_mapping = _load_screenshot_vh_mapping()
-
-    # Initialize counters and storage
-    samples = []
-    node_invalid_types = defaultdict(int)
-
-    processed_img_cnt = 0
-    valid_img_cnt = 0
-    iterated_elem_cnt = 0
-    last_sample_cnt = 0
-
-    task_counters = {
-        'text_loc': 0,
-        'ocr': 0,
-        'elemclass': 0,
-        'intentgnd': 0,
-        'widgetlist': 0,
-    }
-
-    # Process each screenshot/view-hierarchy pair
-    for sample_idx, (screenshot_rel_path, vh_rel_path) in tqdm(
-        enumerate(mv_screenshot_vh_mapping.items()),
-        total=len(mv_screenshot_vh_mapping)
-    ):
-        # Debug mode: only process first few samples
-        if DEBUG and sample_idx % 5000 > 3:
-            continue
-        # Extract sample ID and skip invalid samples
+    try:
         sample_id = int(os.path.basename(screenshot_rel_path).split('.')[0])
         if sample_id in INVALID_SAMPLE_IDS:
-            continue
+            return _bundle_screenshot_result(
+                samples, counters, elem_type_cnt, package_cnt,
+                node_invalid_types, per_part_stats,
+                processed, valid, iterated, errors,
+            )
 
-        # Resolve full paths
         screenshot_file = os.path.join(MOBILEVIEWS_DIR, screenshot_rel_path)
         vh_file = os.path.join(MOBILEVIEWS_DIR, vh_rel_path)
-
         if not os.path.exists(screenshot_file) or not os.path.exists(vh_file):
-            continue
+            return _bundle_screenshot_result(
+                samples, counters, elem_type_cnt, package_cnt,
+                node_invalid_types, per_part_stats,
+                processed, valid, iterated, errors,
+            )
 
-        processed_img_cnt += 1
+        processed = 1
+        part_name = screenshot_rel_path.split('/', 1)[0]
+        per_part_stats[part_name]['images_seen'] += 1
 
-        # Load view hierarchy
         with open(vh_file, 'r') as f:
             vh = json.load(f)
         nodes = vh["views"]
 
-        # Load and validate image
         img = cv2.imread(screenshot_file)
         if img is None:
-            continue
+            return _bundle_screenshot_result(
+                samples, counters, elem_type_cnt, package_cnt,
+                node_invalid_types, per_part_stats,
+                processed, valid, iterated, errors,
+            )
 
-        # Crop image if too tall (max height 1920)
         if img.shape[0] > 1920:
             img = img[:1920]
             cv2.imwrite(screenshot_file, img)
 
         height, width = img.shape[:2]
 
-        # Step 1: Filter and validate nodes
-        all_valid_nodes = []
+        # Step 1: filter and validate nodes
+        all_valid_nodes: List[Dict] = []
         for node in nodes:
-            # Skip non-leaf nodes and invisible nodes
             if len(node.get('children', [])) > 0 or not node.get('visible', False):
                 continue
+            iterated += 1
 
-            iterated_elem_cnt += 1
-
-            # Validate bounding box
             if not _validate_node_bounds(node, width, height, all_valid_nodes):
-                # Track which validation failed (simplified - actual tracking in validation)
                 (x1, y1), (x2, y2) = node["bounds"]
-
-                # Check for duplicate
                 is_duplicate = False
                 for existing_node in all_valid_nodes:
                     (x3, y3), (x4, y4) = existing_node["bounds"]
@@ -670,39 +687,34 @@ def make_mobileviews_data() -> None:
                         break
                 if is_duplicate:
                     continue
-
-                # Check invalid coordinates
                 if x1 < 0 or y1 < 0 or x2 > width or y2 > height or x1 >= x2 or y1 >= y2:
                     node_invalid_types['invalid box coordinates'] += 1
                     continue
-
-                # Check oversize
                 if (x2 - x1) * (y2 - y1) / (height * width) >= 0.65:
                     node_invalid_types['oversize element'] += 1
                     continue
-
-                # Check too small
                 if (y2 - y1) / height <= 0.005 or (x2 - x1) / width <= 0.005:
                     node_invalid_types['too small element'] += 1
                     continue
 
             (x1, y1), (x2, y2) = node["bounds"]
-
-            # Check if element is actually displayed (not pure color)
             if is_pure_color(img, [x1, y1, x2, y2]):
                 node_invalid_types['element not displayed'] += 1
                 continue
 
             all_valid_nodes.append(node)
 
-        # Step 2: Filter overlapping elements using OCR
+        # Step 2: overlap filtering via OCR (subprocess to tesseract)
         all_valid_nodes = _filter_overlapping_elements(all_valid_nodes, img)
+        if not all_valid_nodes:
+            return _bundle_screenshot_result(
+                samples, counters, elem_type_cnt, package_cnt,
+                node_invalid_types, per_part_stats,
+                processed, valid, iterated, errors,
+            )
 
-        if len(all_valid_nodes) == 0:
-            continue
-
-        # Step 3: Validate text language
-        all_node_texts = []
+        # Step 3: language check on the screen's texts
+        all_node_texts: List[str] = []
         for node in all_valid_nodes:
             raw = node.get('text', None)
             if raw is None:
@@ -721,164 +733,285 @@ def make_mobileviews_data() -> None:
                 break
         if contain_invalid_characters:
             node_invalid_types['invalid text language'] += len(all_valid_nodes)
-            continue
+            return _bundle_screenshot_result(
+                samples, counters, elem_type_cnt, package_cnt,
+                node_invalid_types, per_part_stats,
+                processed, valid, iterated, errors,
+            )
 
-        # Step 4: Create image symlink
-        new_sc_file = os.path.join(save_images_to, os.path.basename(screenshot_file))
-        if not os.path.exists(new_sc_file):
-            os.symlink(screenshot_file, new_sc_file)
+        short_img_path = screenshot_file[screenshot_file.find(DATASET_NAME):]
 
-        short_img_path = new_sc_file[new_sc_file.find(DATASET_NAME):]
-
-        # Step 5: Process each node for different tasks
-        used_boxes = []
-        used_node_descs = []
+        # Step 4: per-node sample generation
+        used_boxes: List[str] = []
+        used_node_descs: List[str] = []
+        # `package` is reused outside the loop as the screen-level attribution.
+        package = ''
 
         for node in all_valid_nodes:
             (x1, y1), (x2, y2) = node["bounds"]
-
-            # Create bound_box string for deduplication
             bound_box_str = f"{int(x1)},{int(y1)},{int(x2)},{int(y2)}"
             if bound_box_str in used_boxes:
                 node_invalid_types['overlapping element'] += 1
                 continue
             used_boxes.append(bound_box_str)
 
-            # Normalize coordinates
-            box, box_str = _normalize_box(x1, y1, x2, y2, width, height)
-            normalized_center, center_str = _normalize_center(x1, y1, x2, y2, width, height)
-
+            _, box_str = _normalize_box(x1, y1, x2, y2, width, height)
+            normalized_center, center_str = _normalize_center(
+                x1, y1, x2, y2, width, height
+            )
             unnormalized_box = [int(x1), int(y1), int(x2), int(y2)]
             box_w, box_h = x2 - x1, y2 - y1
             center = [(x1 + x2) // 2, (y1 + y2) // 2]
 
-            # Extract node information
             elem_type = classify_node(node)
             elem_text = node.get('text', None)
             package = node.get('package', '')
+            elem_type_cnt[elem_type] += 1
+            if package:
+                package_cnt[package] += 1
 
-            # Get node description
             node_desc = _get_node_description(node)
             node['node_desc'] = node_desc
 
-            # Generate text localization samples
             if elem_text is not None and 0 < len(elem_text) <= 200:
                 elem_text = elem_text.strip()
-                task_counters['text_loc'], _ = _process_node_for_textloc(
-                    node=node,
-                    elem_text=elem_text,
-                    all_node_texts=all_node_texts,
-                    box_str=box_str,
-                    center_str=center_str,
-                    unnormalized_box=unnormalized_box,
-                    short_img_path=short_img_path,
-                    sample_id=sample_id,
-                    package=package,
-                    samples=samples,
-                    text_loc_cnt=task_counters['text_loc'],
+                counters['text_loc_cnt'], _ = _process_node_for_textloc(
+                    node=node, elem_text=elem_text,
+                    all_node_texts=all_node_texts, box_str=box_str,
+                    center_str=center_str, unnormalized_box=unnormalized_box,
+                    short_img_path=short_img_path, sample_id=sample_id,
+                    package=package, samples=samples,
+                    text_loc_cnt=counters['text_loc_cnt'],
+                )
+                counters['ocr_cnt'], _ = _process_node_for_ocr(
+                    node=node, elem_text=elem_text, box_str=box_str,
+                    center_str=center_str, unnormalized_box=unnormalized_box,
+                    short_img_path=short_img_path, sample_id=sample_id,
+                    package=package, img=img, center=center,
+                    box_w=int(box_w), box_h=int(box_h), samples=samples,
+                    ocr_cnt=counters['ocr_cnt'],
                 )
 
-                # Generate OCR samples
-                task_counters['ocr'], _ = _process_node_for_ocr(
-                    node=node,
-                    elem_text=elem_text,
-                    box_str=box_str,
-                    center_str=center_str,
-                    unnormalized_box=unnormalized_box,
-                    short_img_path=short_img_path,
-                    sample_id=sample_id,
-                    package=package,
-                    img=img,
-                    center=center,
-                    box_w=int(box_w),
-                    box_h=int(box_h),
-                    samples=samples,
-                    ocr_cnt=task_counters['ocr'],
-                )
-
-            # Generate intent grounding samples
             if node_desc:
-                task_counters['intentgnd'], _ = _process_node_for_intentgnd(
-                    node=node,
-                    node_desc=node_desc,
+                counters['intentgnd_cnt'], _ = _process_node_for_intentgnd(
+                    node=node, node_desc=node_desc,
                     elem_text=elem_text or '',
-                    all_node_texts=all_node_texts,
-                    box_str=box_str,
+                    all_node_texts=all_node_texts, box_str=box_str,
                     center_str=center_str,
                     normalized_center=normalized_center,
                     unnormalized_box=unnormalized_box,
-                    short_img_path=short_img_path,
-                    sample_id=sample_id,
-                    package=package,
-                    used_node_descs=used_node_descs,
+                    short_img_path=short_img_path, sample_id=sample_id,
+                    package=package, used_node_descs=used_node_descs,
                     samples=samples,
-                    intentgnd_cnt=task_counters['intentgnd'],
+                    intentgnd_cnt=counters['intentgnd_cnt'],
                 )
 
-        # Generate widget list sample for the entire screen
-        task_counters['widgetlist'], _ = _process_screen_for_widgetlist(
+        # Step 5: one widget-list sample per screen
+        counters['widgetlist_cnt'], _ = _process_screen_for_widgetlist(
             all_valid_nodes=all_valid_nodes,
-            width=width,
-            height=height,
-            short_img_path=short_img_path,
-            sample_id=sample_id,
-            package=package,
-            samples=samples,
-            widgetlist_cnt=task_counters['widgetlist'],
+            width=width, height=height,
+            short_img_path=short_img_path, sample_id=sample_id,
+            package=package, samples=samples,
+            widgetlist_cnt=counters['widgetlist_cnt'],
         )
 
-        # Update valid image count
-        if len(samples) > last_sample_cnt:
-            valid_img_cnt += 1
-        last_sample_cnt = len(samples)
+        if samples:
+            valid = 1
+            per_part_stats[part_name]['images_valid'] += 1
+        per_part_stats[part_name]['samples'] += len(samples)
 
-    # Generate summary report
-    invalid_elem = sum(cnt for cnt in node_invalid_types.values())
-    report = (
-        f"Valid image ratio: {valid_img_cnt} / {processed_img_cnt} = "
-        f"{valid_img_cnt/processed_img_cnt:.2f}\n"
-        f"Invalid elem ratio: {invalid_elem} / {iterated_elem_cnt} = "
-        f"{invalid_elem/iterated_elem_cnt:.2f}\n"
-        f"text_loc_cnt: {task_counters['text_loc']} | "
-        f"ocr_cnt: {task_counters['ocr']} | "
-        f"elemclass_cnt: {task_counters['elemclass']} | "
-        f"intentgnd_cnt: {task_counters['intentgnd']} | "
-        f"widgetlist_cnt: {task_counters['widgetlist']}"
+    except Exception:
+        errors.append([screenshot_rel_path, traceback.format_exc()])
+
+    return _bundle_screenshot_result(
+        samples, counters, elem_type_cnt, package_cnt,
+        node_invalid_types, per_part_stats,
+        processed, valid, iterated, errors,
     )
-    print(report)
 
-    # Save results
-    save_to_dir = os.path.join(ROOT, "mobileviews_processed")
+
+def _bundle_screenshot_result(
+    samples: List[Dict],
+    counters: Dict[str, int],
+    elem_type_cnt: Dict[str, int],
+    package_cnt: Dict[str, int],
+    node_invalid_types: Dict[str, int],
+    per_part_stats: Dict[str, Dict[str, int]],
+    processed: int,
+    valid: int,
+    iterated: int,
+    errors: List[List[str]],
+) -> Dict[str, Any]:
+    """Pack a worker's locals into a small pickleable dict."""
+    return {
+        'samples': samples,
+        'counters': dict(counters),
+        'elem_type_cnt': dict(elem_type_cnt),
+        'package_cnt': dict(package_cnt),
+        'node_invalid_types': dict(node_invalid_types),
+        'per_part_stats': {k: dict(v) for k, v in per_part_stats.items()},
+        'processed': processed,
+        'valid': valid,
+        'iterated': iterated,
+        'errors': errors,
+    }
+
+
+def make_mobileviews_data() -> None:
+    """Generate MobileViews training samples and write them to disk.
+
+    Iterates through all screenshot/view-hierarchy pairs, validates UI elements,
+    filters invalid nodes, and generates samples for enabled tasks. Outputs summary
+    statistics and a small random subset for quick inspection.
+    """
+    # Load screenshot to view hierarchy mapping
+    mv_screenshot_vh_mapping = _load_screenshot_vh_mapping()
+
+    # Initialize counters and storage
+    samples = []
+    node_invalid_types = defaultdict(int)
+
+    processed_img_cnt = 0
+    valid_img_cnt = 0
+    iterated_elem_cnt = 0
+
+    # Canonical per-task counters: defaultdict matches the convention in
+    # make_webui_data.py. Keys are `<task>_cnt`; CamelCase display names
+    # live in TASK_DISPLAY_NAMES above.
+    task_counters: Dict[str, int] = defaultdict(int)
+
+    # Auxiliary stats surfaced in info.json (kept lightweight on purpose).
+    elem_type_cnt: Counter = Counter()
+    package_cnt: Counter = Counter()
+    per_part_stats: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {'images_seen': 0, 'images_valid': 0, 'samples': 0}
+    )
+
+    errors: List[List[str]] = []
+
+    # Build the work list. In DEBUG mode the original used `sample_idx % 5000`
+    # to keep ~4 of every 5000 items — preserve that selection here so the
+    # parallel and sequential paths submit the same set.
+    items: List[Tuple[str, str]] = list(mv_screenshot_vh_mapping.items())
+    if DEBUG:
+        items = [it for i, it in enumerate(items) if i % 5000 <= 3]
+
+    # ------------------------------------------------------------------
+    # Streaming aggregator: shared by parallel + sequential branches so the
+    # bookkeeping logic lives in exactly one place.
+    # ------------------------------------------------------------------
+    def _aggregate(result: Dict[str, Any]) -> None:
+        nonlocal processed_img_cnt, valid_img_cnt, iterated_elem_cnt
+        samples.extend(result['samples'])
+        for k, v in result['counters'].items():
+            task_counters[k] += v
+        for k, v in result['elem_type_cnt'].items():
+            elem_type_cnt[k] += v
+        for k, v in result['package_cnt'].items():
+            package_cnt[k] += v
+        for k, v in result['node_invalid_types'].items():
+            node_invalid_types[k] += v
+        for part, stats in result['per_part_stats'].items():
+            for k, v in stats.items():
+                per_part_stats[part][k] += v
+        processed_img_cnt += result['processed']
+        valid_img_cnt += result['valid']
+        iterated_elem_cnt += result['iterated']
+        errors.extend(result['errors'])
+
+    use_parallel = NUM_WORKERS > 1
+    print(
+        f"Processing {len(items)} screenshots "
+        f"{'in parallel across ' + str(NUM_WORKERS) + ' workers' if use_parallel else 'sequentially'}..."
+    )
+
+    if use_parallel:
+        # imap_unordered streams results back as workers finish — keeps the IPC
+        # queue from filling and avoids the classic deadlock where workers
+        # block on a full output queue. Exceptions are caught inside the
+        # worker and emitted as ``errors`` entries, so a poisonous input
+        # cannot hang the pool either.
+        chunksize = max(1, min(64, len(items) // max(1, NUM_WORKERS * 4)))
+        with mp.Pool(processes=NUM_WORKERS) as pool:
+            pbar = tqdm(
+                pool.imap_unordered(
+                    _process_one_screenshot, items, chunksize=chunksize
+                ),
+                total=len(items),
+                desc=f"MobileViews ×{NUM_WORKERS}",
+                smoothing=0.05,
+            )
+            for result in pbar:
+                _aggregate(result)
+    else:
+        for item in tqdm(items, total=len(items), desc="MobileViews"):
+            _aggregate(_process_one_screenshot(item))
+
+    # Surface mass-failures loudly (e.g. tesseract missing, or a typo that
+    # crashes every worker call) — same pattern as make_webui_data.
+    print_error_summary(errors, total_tasks=len(items))
+
+    # After parallel aggregation each worker's per-task counters started at 0,
+    # so sample IDs collide globally. Renumber by extracting the `<prefix>`
+    # from each id and re-striping the trailing integer.
+    renumber_sample_ids(samples)
+
+    # ------------------------------------------------------------------
+    # Output filename + unified reporting via run_info.save_run_info().
+    # ------------------------------------------------------------------
+    save_to_dir = os.path.join(ROOT, f"{DATASET_NAME}_processed")
     os.makedirs(save_to_dir, exist_ok=True)
-
     file_name = os.path.join(
         save_to_dir,
-        f"mobileviews_{'TextLoc_' if TEXTLOC else ''}{'OCR_' if OCR else ''}{'ElemClass_' if ELEMCLASS else ''}{'IntentGnd_' if INTENTGND else ''}{'WidgetList_' if WIDGETLIST else ''}scale{SCALE}_{len(samples)//1000}k"
+        f"{DATASET_NAME}_{'TextLoc_' if TEXTLOC else ''}{'OCR_' if OCR else ''}"
+        f"{'ElemClass_' if ELEMCLASS else ''}{'IntentGnd_' if INTENTGND else ''}"
+        f"{'WidgetList_' if WIDGETLIST else ''}scale{SCALE}_{len(samples)//1000}k"
         f"{'_debug' if DEBUG else ''}.json"
     )
     print(f"Save to {file_name}")
 
-    # Save info file
-    with open(file_name.replace('.json', '_info.json'), "w") as f:
-        json.dump({
-            'num_samples': len(samples),
-            'valid_img_cnt': valid_img_cnt,
-            'processed_img_cnt': processed_img_cnt,
-            'invalid_elem': invalid_elem,
-            'iterated_elem_cnt': iterated_elem_cnt,
-            'text_loc_cnt': task_counters['text_loc'],
-            'ocr_cnt': task_counters['ocr'],
-            'elemclass_cnt': task_counters['elemclass'],
-            'intentgnd_cnt': task_counters['intentgnd'],
-            'widgetlist_cnt': task_counters['widgetlist'],
-            'node_invalid_types': dict(node_invalid_types),
-        }, f, indent=2)
+    save_run_info(
+        dataset=DATASET_NAME,
+        output_path=file_name,
+        samples=samples,
+        counters=task_counters,
+        config={
+            'debug': DEBUG,
+            'scale': SCALE,
+            'prob_box': PROB_BOX,
+            'dataset_parts': DATASET_PARTS,
+        },
+        images={
+            'processed': processed_img_cnt,
+            'valid': valid_img_cnt,
+        },
+        elements={
+            'iterated': iterated_elem_cnt,
+            'invalid': sum(node_invalid_types.values()),
+            'invalid_breakdown': dict(
+                sorted(node_invalid_types.items(), key=lambda kv: -kv[1])
+            ),
+            'by_type': dict(elem_type_cnt.most_common()),
+        },
+        tasks_enabled={
+            TASK_DISPLAY_NAMES[key]: enabled
+            for key, enabled in {
+                'text_loc_cnt': TEXTLOC,
+                'ocr_cnt': OCR,
+                'elemclass_cnt': ELEMCLASS,
+                'intentgnd_cnt': INTENTGND,
+                'widgetlist_cnt': WIDGETLIST,
+            }.items()
+        },
+        extra_sections={
+            'per_part': dict(per_part_stats),
+            'top_packages': dict(package_cnt.most_common(20)),
+            'errors_summary': summarize_errors(errors),
+            'errors_total': len(errors),
+        },
+    )
 
-    # Save sample file (random subset)
-    with open(file_name.replace(".json", "_sample.json"), 'w') as f:
-        json.dump(random.sample(samples, min(len(samples), 128)), f, indent=2)
-
-    # Save full dataset
+    # Full dataset.
     with open(file_name, 'w') as f:
         json.dump(samples, f, indent=2)
 

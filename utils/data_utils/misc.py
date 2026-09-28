@@ -408,7 +408,7 @@ def parse_axtrees_proto(axtrees, ratio):
 def resize_image(img, max_size=1008):
     height, width = img.shape[:2]
 
-    if max(width, height) <= max_size:
+    if max_size == -1 or max(width, height) <= max_size:
         return img, 1.0  # No resizing, return original ratio
 
     # Calculate the new dimensions while maintaining aspect ratio
